@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import sys
 import time
 from concurrent.futures import as_completed
@@ -20,6 +19,11 @@ StatusCallback = Optional[Callable[[str], None]]
 
 DOMAINS = ["k2s.cc"]
 
+# Default timeout (seconds) applied to every outbound request in this module.
+# Without a timeout, a blocked/black-holed IP causes requests to hang
+# indefinitely, which is what makes the CLI/GUI appear to freeze.
+DEFAULT_TIMEOUT = 15
+
 
 def _emit_status(callback: StatusCallback, message: str) -> None:
     if callback:
@@ -34,20 +38,49 @@ def default_captcha_callback(image_bytes: bytes, challenge: str, captcha_url: st
 
 def fetch_captcha(status_callback: StatusCallback = None) -> dict:
     _emit_status(status_callback, "Requesting captcha challenge...")
-    return requests.post(f"https://{choice(DOMAINS)}/api/v2/requestCaptcha").json()
+    response = requests.post(f"https://{choice(DOMAINS)}/api/v2/requestCaptcha", timeout=DEFAULT_TIMEOUT)
+    return response.json()
 
 
-def generate_from_key(url: str, key: str, proxy: Optional[str], *, status_callback: StatusCallback = None) -> str:
+def generate_from_key(
+    url: str,
+    key: str,
+    proxy: Optional[str],
+    *,
+    status_callback: StatusCallback = None,
+    max_retries: int = 5,
+) -> str:
+    """Exchange a free_download_key for a real download URL.
+
+    Retries up to ``max_retries`` times with a short backoff instead of
+    looping forever: previously any failure (including a timeout) was
+    silently swallowed and retried immediately with no upper bound, which
+    could spin/hang indefinitely if the IP was blocked.
+    """
     prox = {"https": f"http://{proxy}"} if proxy else None
 
-    while True:
-        with contextlib.suppress(Exception):
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
             response = requests.post(
                 f"https://{choice(DOMAINS)}/api/v2/getUrl",
                 json={"file_id": url, "free_download_key": key},
                 proxies=prox,
+                timeout=DEFAULT_TIMEOUT,
             ).json()
             return response["url"]
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - network/parse errors are all retryable here
+            last_error = exc
+            _emit_status(
+                status_callback,
+                f"generate_from_key attempt {attempt}/{max_retries} failed: {exc}",
+            )
+            if attempt < max_retries:
+                time.sleep(min(2**attempt, 10))
+
+    raise RuntimeError(f"Failed to generate URL from key after {max_retries} attempts") from last_error
 
 
 def generate_download_urls(
@@ -77,7 +110,7 @@ def generate_download_urls(
     urls: List[str] = []
 
     captcha = fetch_captcha(status_callback)
-    captcha_image = requests.get(captcha["captcha_url"]).content
+    captcha_image = requests.get(captcha["captcha_url"], timeout=DEFAULT_TIMEOUT).content
     response = captcha_callback(captcha_image, captcha["challenge"], captcha["captcha_url"])
 
     for proxy in proxy_pool:
@@ -107,7 +140,7 @@ def generate_download_urls(
                 if message == "Invalid captcha code":
                     _emit_status(status_callback, "Captcha invalid, requesting a new one.")
                     captcha = fetch_captcha(status_callback)
-                    captcha_image = requests.get(captcha["captcha_url"]).content
+                    captcha_image = requests.get(captcha["captcha_url"], timeout=DEFAULT_TIMEOUT).content
                     response = captcha_callback(captcha_image, captcha["challenge"], captcha["captcha_url"])
                     continue
                 if message == "File not found":
@@ -142,6 +175,7 @@ def generate_download_urls(
                     f"https://{choice(DOMAINS)}/api/v2/getUrl",
                     json={"file_id": file_id, "free_download_key": free_download_key},
                     proxies=prox,
+                    timeout=DEFAULT_TIMEOUT,
                 )
                 futures.append(future)
 
@@ -169,5 +203,6 @@ def get_name(file_id: str) -> str:
     response = requests.post(
         f"https://{choice(DOMAINS)}/api/v2/getFilesInfo",
         json={"ids": [file_id]},
+        timeout=DEFAULT_TIMEOUT,
     ).json()
     return response["files"][0]["name"]

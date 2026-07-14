@@ -42,9 +42,33 @@ StatusCallback = Optional[Callable[[str], None]]
 ProgressCallback = Optional[Callable[[int, int, int, int], None]]
 CaptchaCallback = k2s_client.CaptchaCallback
 
+# Timeout (seconds) for the HEAD request used to discover total file size.
+# Previously unset, so a blocked/unresponsive IP would hang here forever.
+HEAD_REQUEST_TIMEOUT = 15
+
 
 class DownloadCancelled(RuntimeError):
     """Raised when a download is cancelled by the user."""
+
+
+class ChunkDownloadFailed(RuntimeError):
+    """Raised when a chunk exhausts its retry budget.
+
+    This usually means the source IP (and/or every proxy tried) is being
+    blocked or rate-limited by the host, rather than a one-off network
+    hiccup. Distinguished from ``DownloadCancelled`` so callers can tell
+    "the user stopped it" apart from "we gave up".
+    """
+
+
+# How many times a single range/chunk may fail before we give up on the
+# whole download instead of retrying forever (previous behaviour: infinite
+# retries with no backoff, which is what made the app appear to hang when
+# every proxy/IP was blocked).
+MAX_CHUNK_RETRIES = 8
+# Exponential backoff between retry attempts for a single chunk.
+CHUNK_RETRY_BACKOFF_BASE = 1.0
+CHUNK_RETRY_BACKOFF_CAP = 30.0
 
 
 def _emit_status(callback: StatusCallback, message: str) -> None:
@@ -137,6 +161,32 @@ class Downloader:
 
     def log(self, message: str) -> None:
         _emit_status(self.status_callback, message)
+
+    def _mark_chunk_failed(self, range_meta: Dict[str, object], reason: str) -> None:
+        """Record a failed chunk attempt with a bounded retry budget.
+
+        Increments ``range_meta["attempts"]`` and schedules the next retry
+        with exponential backoff. Once ``MAX_CHUNK_RETRIES`` is exceeded,
+        marks the range as permanently ``failed`` so the scheduling loop in
+        ``_download_once`` can stop and raise ``ChunkDownloadFailed`` instead
+        of retrying forever.
+        """
+        attempts = int(range_meta.get("attempts", 0)) + 1
+        range_meta["attempts"] = attempts
+        range_meta["last_error"] = reason
+        range_meta["inUse"] = False
+
+        if attempts >= MAX_CHUNK_RETRIES:
+            range_meta["failed"] = True
+            self.log(f"Chunk permanently failed after {attempts} attempts ({reason}).")
+            return
+
+        backoff = min(CHUNK_RETRY_BACKOFF_CAP, CHUNK_RETRY_BACKOFF_BASE * (2 ** (attempts - 1)))
+        range_meta["next_retry_at"] = time.time() + backoff
+        self.log(
+            f"Chunk attempt {attempts}/{MAX_CHUNK_RETRIES} failed ({reason}); "
+            f"retrying in {backoff:.1f}s."
+        )
 
     def refresh_proxies(self, *, refresh: bool = False) -> None:
         self.proxies = get_working_proxies(refresh=refresh, status_callback=self.status_callback)
@@ -253,7 +303,19 @@ class Downloader:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
         }
-        size_in_bytes = requests.head(urls[-1], allow_redirects=True, headers=headers).headers.get("Content-Length")
+        try:
+            head_response = requests.head(
+                urls[-1],
+                allow_redirects=True,
+                headers=headers,
+                timeout=HEAD_REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(
+                f"Could not reach the download host to determine file size (possibly blocked): {exc}"
+            ) from exc
+
+        size_in_bytes = head_response.headers.get("Content-Length")
         if not size_in_bytes:
             raise RuntimeError("Size cannot be determined.")
 
@@ -335,6 +397,20 @@ class Downloader:
                         timeout=20,
                     )
 
+                    if response.status_code not in (200, 206):
+                        # A non-success status (403/429/5xx, etc.) usually means
+                        # this proxy or our own IP has been blocked/rate-limited
+                        # by the host. Previously this was ignored and only
+                        # caught later by a coincidental byte-count mismatch;
+                        # detecting it here lets the range be retried sooner
+                        # and lets us record *why* it failed for the caller.
+                        response.close()
+                        self._mark_chunk_failed(
+                            range_meta,
+                            f"HTTP {response.status_code} via proxy {proxy_value or 'LOCAL'}",
+                        )
+                        return
+
                     for data in response.iter_content(self.block_size):
                         if self.stop_event.is_set():
                             stop = True
@@ -348,11 +424,14 @@ class Downloader:
                 chunk_bytes = len(buffer.getvalue())
                 if not math.isclose(chunk_bytes, expected_bytes, abs_tol=1):
                     report_progress(-chunk_bytes)
-                    range_meta["inUse"] = False
+                    self._mark_chunk_failed(
+                        range_meta, f"size mismatch: got {chunk_bytes} expected {expected_bytes}"
+                    )
                     if self.url_locks[thread_index].locked():
                         self.url_locks[thread_index].release()
                     return
 
+                range_meta.pop("last_error", None)
                 tmp_filename.write_bytes(buffer.getvalue())
                 if proxy_idx not in self.working_proxy_indexes:
                     self.working_proxy_indexes.append(proxy_idx)
@@ -378,15 +457,27 @@ class Downloader:
                 if self.proxy_locks[proxy_idx].locked():
                     self.proxy_locks[proxy_idx].release()
 
+        failed_chunk: Optional[tuple] = None
+
         try:
             while self._done_count < len(ranges):
                 if stop:
                     break
+                now = time.time()
                 for idx, meta in ranges.items():
                     if self.stop_event.is_set():
                         stop = True
                         break
+                    if meta.get("failed"):
+                        failed_chunk = (idx, meta.get("last_error", "unknown error"), meta.get("attempts", 0))
+                        stop = True
+                        break
                     if meta["inUse"] or meta["downloaded"]:
+                        continue
+                    if meta.get("next_retry_at", 0) > now:
+                        # Still within this chunk's backoff window; skip it
+                        # for now instead of hammering the same failing
+                        # source again immediately.
                         continue
 
                     part_path = self.tmp_dir / f"{filename}.part{str(idx).zfill(len(str(split_count)))}"
@@ -429,6 +520,13 @@ class Downloader:
                     lock.release()
             self._notify_proxy_state()
             progress_bar.close()
+
+        if failed_chunk is not None:
+            idx, reason, attempts = failed_chunk
+            raise ChunkDownloadFailed(
+                f"Chunk {idx} failed after {attempts} attempts (last error: {reason}). "
+                "The source IP and/or every proxy tried may be blocked or rate-limited."
+            )
 
         if stop:
             raise DownloadCancelled("Download cancelled")
@@ -482,4 +580,3 @@ class Downloader:
         ]
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         return result.returncode == 0 and not result.stdout
-
