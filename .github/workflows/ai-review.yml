@@ -1,0 +1,32 @@
+name: AI Pull Request Reviewer
+on:
+  pull_request:
+    types: [opened, synchronize, reopened] # PR 被建立、有新 commit 推進去、或重新開啟時觸發
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 獲取完整的 git 歷史以比對差異
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install anthropic PyGithub
+
+      - name: Run AI Reviewer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.REVIEWER_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_NAME: ${{ github.repository }}
+        run: python .github/scripts/ai_review.py
