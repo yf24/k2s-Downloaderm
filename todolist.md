@@ -79,23 +79,37 @@
 
 ## P2 — 錯誤處理與健壯性
 
-- [ ] **P2-1 `contextlib.suppress(Exception)` 靜默吞掉所有網路錯誤**
-  - 位置：`src/k2s_downloader/core/downloader.py:391`
+- [x] **P2-1 `contextlib.suppress(Exception)` 靜默吞掉所有網路錯誤**（2026-07-17 完成）
+  - 位置：`src/k2s_downloader/core/downloader.py`（`download_chunk` 內部）
   - 問題：整段 GET/streaming 被吞例外，失敗原因（連線錯誤 vs. 逾時 vs. proxy 拒絕）無從診斷，只能靠事後 byte 數不符推測。
-  - 建議：改捕捉特定 `requests` 例外並記錄原因到 `range_meta["last_error"]` / log。
+  - 修法：拆成兩層 — 內層 `except requests.exceptions.RequestException` 捕捉網路層錯誤，訊息含 proxy 標籤與原始例外，經 `_mark_chunk_failed` 寫入 `range_meta["last_error"]`／log（訊息前綴 `"request error via proxy ..."`）；
+    外層新增 `except Exception`（涵蓋請求之後的非預期錯誤，如寫檔失敗），訊息前綴 `"unexpected error via proxy ..."` — 兩者都不再靜默吞掉，且維持原本「例外絕不逃出 thread、導致 range 卡在 `inUse=True` 永久等待」的安全網。移除已無用的 `contextlib` import。
+  - 測試：`tests/test_downloader_error_handling.py`（`ConnectionError` 正確被記錄為 `request error`、非 `RequestException` 的例外被外層攔截記錄為 `unexpected error`，兩者皆不再落入誤導性的 `size mismatch` 訊息）。
 
-- [ ] **P2-2 散落各處的硬編碼 timeout**
-  - 位置：`downloader.py:397`（20s）、`k2s_client.py:132`（5s）、多處 `DEFAULT_TIMEOUT`
-  - 建議：集中成具名常數或可由 `Downloader`/CLI 參數調整。
+- [x] **P2-2 散落各處的硬編碼 timeout**（2026-07-17 完成）
+  - 位置：`downloader.py`（chunk request 20s、stall watchdog 20s）、`k2s_client.py`（captcha 迴圈內 5s）、`proxy.py`（proxyscrape fetch 30s）
+  - 修法：全部改為具名常數 —
+    `downloader.py`：`CHUNK_REQUEST_TIMEOUT = 20`（`requests.get` 的 connect/read timeout）與 `CHUNK_STALL_TIMEOUT = 20`（串流無新資料時的 watchdog，語意不同但目前同值，各自獨立命名方便未來調整）；
+    `k2s_client.py`：`CAPTCHA_SOLVE_TIMEOUT = 5`（比 `DEFAULT_TIMEOUT` 短，避免單一失效 proxy 卡住整個 captcha 迴圈）；
+    `proxy.py`：`PROXYSCRAPE_FETCH_TIMEOUT = 30`。
+  - **評估「是否開放 CLI/Downloader 參數調整」的結論**：暫不開放。這些常數已經是模組層級可直接修改的唯一真相來源（本身就是本項的核心價值），但要再往上開放成 CLI flag 或 `Downloader.__init__` 參數會擴大 CLI 介面與建構子簽章而目前沒有實際需求（YAGNI）；若未來有使用者反應網路環境需要不同 timeout，再評估開放，記在此處供後續 session 參考。
+  - 測試：`tests/test_downloader_error_handling.py` 內的 regression guard（斷言 `requests.get` 呼叫時 `timeout == downloader_module.CHUNK_REQUEST_TIMEOUT`），確保未來不會被重新內聯成 magic number。
 
-- [ ] **P2-3 proxy 安全性：以 `http://` 承載 HTTPS 且清單來自不可信第三方**
-  - 位置：`core/proxy.py:67`（proxyscrape 來源）、`downloader.py:384`
+- [x] **P2-3 proxy 安全性：以 `http://` 承載 HTTPS 且清單來自不可信第三方**（2026-07-17 完成）
+  - 位置：`core/proxy.py`（proxyscrape 來源）、`downloader.py`（`_acquire_proxy_lock`、`download_chunk` 內建構 `prox` dict 處）
   - 問題：使用來路不明的公開 proxy 轉發流量有 MITM 風險。
-  - 建議：文件明確警告、預設 opt-in；評估直連優先、proxy 為 fallback。
+  - 修法：
+    1. **直連優先**：`_acquire_proxy_lock` 每次搶鎖前，先嘗試 index 0（`get_working_proxies` 保證恆為 `None`＝直連）；只有直連目前忙碌／不可用時才 fallback 到已知可用清單或隨機 proxy。
+    2. **文件明確警告**：`Readme.md` 新增「Security Note: Public Proxies」段落；`proxy.py` 的 `get_working_proxies` docstring 與 `downloader.py` 建構 `prox` dict 處都補上 MITM 風險說明（proxy 連線本身是未驗證的明文 HTTP，即使目標是 HTTPS）。
+    3. 「預設 opt-in」現況：`Downloader` 本來就是「沒有 proxy 清單就先嘗試直連，proxy 只在直連失敗/被擋時才會被用到」（`_acquire_proxy_lock` 的行為），已符合「直連優先、proxy 為 fallback」精神，故未額外變更預設行為（仍會自動 `refresh_proxies()` 取得清單以便直連失敗時可退避使用）。
+  - 測試：`tests/test_proxy_preference_and_cache.py::TestDirectConnectionPreference`（直連可用時必回傳 index 0；直連忙碌時會 fallback 且不是 0）。
 
-- [ ] **P2-4 快取檔寫在 CWD**
-  - 位置：`downloader.py`（`urls.json`）、`proxy.py:43`（`proxies.txt`）
-  - 建議：改為可設定路徑或使用者資料目錄，避免污染執行目錄。
+- [x] **P2-4 快取檔寫在 CWD**（2026-07-17 完成）
+  - 位置：`downloader.py`（`urls.json`，本來就可透過 `url_cache_path` 建構參數設定）、`proxy.py`（`proxies.txt`，原本完全寫死無法覆寫）
+  - 修法：`get_working_proxies` 新增 `cache_path` 參數（預設仍是 CWD 的 `"proxies.txt"`，維持向後相容），寫入前補上 `cache_path.parent.mkdir(parents=True, exist_ok=True)`，讓指定使用者資料目錄等尚未存在的巢狀路徑也能正常寫入。
+    `Downloader.__init__` 新增對應的 `proxy_cache_path` 參數，並在 `refresh_proxies()` 透傳給 `get_working_proxies(cache_path=...)`。
+  - 測試：`tests/test_proxy_preference_and_cache.py::TestProxyCachePathConfigurable`（自訂路徑讀取既有快取、成功寫入自訂路徑、巢狀路徑自動建立父目錄）、
+    `::TestDownloaderProxyCachePathPassthrough`（`Downloader(proxy_cache_path=...)` 正確透傳、預設值與 `get_working_proxies` 預設一致）。
 
 ---
 
@@ -108,9 +122,10 @@
 - [x] **P3-3 `generate_download_urls` captcha / 重試分支測試**（2026-07-16 完成，隨 P0-5/P0-6 一併補上）
   - 見 `tests/test_k2s_client_blocked.py`：invalid captcha 上限、File not found、
     全部 getUrl 失敗、部分成功回傳 partial、stop_event 取消、threads 收斂。
-- [ ] **P3-4 `proxy.get_working_proxies` 測試**
-  - cached / refresh / recheck_cached 三條路徑與空清單 fallback。
-  - 註：目前本機環境未安裝 `pytest`（`pip install -e .[dev]`），CI 亦缺，請一併處理（見 P1-3）。
+- [x] **P3-4 `proxy.get_working_proxies` 測試**（2026-07-17 完成，隨 P2-4 一併補上）
+  - 見 `tests/test_proxy_preference_and_cache.py::TestProxyCachePathConfigurable`：
+    cached（早退路徑，讀取既有快取不驗證）、refresh（成功寫入 + 空清單 fallback 並自動建立巢狀父目錄）、
+    recheck_cached（revalidate 既有清單、剔除失效 proxy）三條路徑皆涵蓋。
 
 ---
 
@@ -133,7 +148,8 @@
 - [ ] **P5-1 建立 canonical 文件**（依全域規範 `requirements-en.md` 含 AC、`readme-en.md` 架構）
   - 中英雙語同步：`*-en.md`（AI/canonical）＋ `*-zh.md`（human-facing）。
 - [~] **P5-2 補齊 tooling 設定**：~~`pyproject.toml` 加入 `[tool.ruff]` / `[tool.pytest.ini_options]`~~（已隨 P1-3 完成）；尚餘：新增 `CONTRIBUTING`。
-- [ ] **P5-3 Readme 補充**：proxy/captcha 實際行為、法律與使用聲明、`.[dev]` 安裝與測試說明。
+- [~] **P5-3 Readme 補充**：~~proxy 安全性警告~~（已隨 P2-3 完成，見「Security Note: Public Proxies」段落）；
+  尚餘：captcha 實際行為說明、法律與使用聲明。（`.[dev]` 安裝與測試說明已隨 P1-3/P1-4 完成。）
 
 ---
 
@@ -142,8 +158,10 @@
 1. ~~先做 **P0-1、P0-2** 並同步補 **P3-1、P3-2**（純函式、好測、風險高）。~~ ✅ 已完成
 2. ~~再處理併發相關 **P0-3、P0-4** 與掛死相關 **P0-5、P0-6**。~~ ✅ 已完成 — **P0 全部 6 項皆已修復**
 3. ~~接著 **P1**（依賴／CI／文件入口）讓專案可持續驗證。~~ ✅ 已完成（P1-1 ~ P1-4 全數完成）
-4. 之後依 P2 → P4 → P5 逐步推進。← 下一步建議從 **P2**（錯誤處理與健壯性）開始
+4. ~~之後 **P2**（錯誤處理與健壯性）。~~ ✅ 已完成 — **P2 全部 4 項（P2-1 ~ P2-4）皆已修復，含 P3-4**
+5. 接著 **P4 → P5** 逐步推進。← 下一步建議從 **P4**（程式碼品質與可維護性）開始
 
-> 註：P0 全項（P0-1 ~ P0-6）與對應測試（P3-1、P3-2、P3-3）已於 2026-07-16 完成並合併於
-> commit 內；分支 `fix/blocked-ip-error-handling` 已推送。所有測試（本機 `.venv`，
-> `PYTHONPATH=src pytest tests`）共 55 個全數通過。接手 session 請從 **P1** 開始逐項認領。
+> 註：P0（P0-1 ~ P0-6）、P1（P1-1 ~ P1-4）已於 2026-07-16 完成並合併進 `main`（PR #3，merge commit `8581b77`）。
+> P2（P2-1 ~ P2-4，含補齊的 P3-4）已於 2026-07-17 完成，分支 `feature/p2-error-handling-robustness`。
+> 所有測試（本機 `.venv`，`pytest -q`，`pyproject.toml` 已設 `pythonpath=["src"]` 免手動設環境變數）
+> 共 65 個全數通過，`ruff check .` 全過。接手 session 請從 **P4** 開始逐項認領。

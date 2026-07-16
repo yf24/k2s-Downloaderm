@@ -15,6 +15,10 @@ StatusCallback = Optional[Callable[[str], None]]
 HTTPS_BATCH_SIZE = 50
 HTTPS_TIMEOUT = 5.0
 HTTPS_RETRIES = 1
+# Timeout (seconds) for fetching the raw proxy candidate list from
+# proxyscrape.com. Larger than HTTPS_TIMEOUT because this is a single
+# request returning a large text list, not a per-proxy liveness probe.
+PROXYSCRAPE_FETCH_TIMEOUT = 30
 
 
 def _batched(items: List[str], size: int):
@@ -33,14 +37,28 @@ def get_working_proxies(
     status_callback: StatusCallback = None,
     max_candidates: int | None = None,
     recheck_cached: bool = False,
+    cache_path: pathlib.Path | str = "proxies.txt",
 ) -> List[Optional[str]]:
     """Return a list of working proxy endpoints.
 
-    The first element is always ``None`` to represent a direct connection.
-    Cached results are stored in ``proxies.txt`` in the current working directory.
+    The first element is always ``None`` to represent a direct connection
+    (``Downloader._acquire_proxy_lock`` relies on this and prefers it over
+    any proxy). Results are cached at ``cache_path``, which defaults to
+    ``proxies.txt`` in the current working directory for backward
+    compatibility; pass an absolute path (e.g. a user data directory) to
+    avoid writing into whatever directory the process happens to be run
+    from.
+
+    SECURITY: candidates come from a public, unauthenticated proxy list
+    (proxyscrape.com) with no vetting beyond a basic HTTPS reachability
+    check. A malicious or compromised proxy in this list can observe or
+    tamper with traffic routed through it (see the MITM note where
+    ``prox`` is built in downloader.py). Only use these for downloads
+    where that risk is acceptable; prefer a direct connection or a
+    trusted proxy of your own when it isn't.
     """
 
-    cache_path = pathlib.Path("proxies.txt")
+    cache_path = pathlib.Path(cache_path)
     cached_proxies: List[str] = []
     if cache_path.exists():
         cached_proxies = [line for line in cache_path.read_text().splitlines() if line]
@@ -66,7 +84,7 @@ def get_working_proxies(
         _emit_status(status_callback, "Fetching proxy candidates from proxyscrape.com ...")
         https_resp = requests.get(
             "https://api.proxyscrape.com/?request=getproxies&proxytype=https&timeout=10000&country=all&ssl=all&anonymity=all",
-            timeout=30,
+            timeout=PROXYSCRAPE_FETCH_TIMEOUT,
         )
         proxies.extend(filter(None, https_resp.text.splitlines()))
 
@@ -157,9 +175,11 @@ def get_working_proxies(
     working_proxies = list(working_set)
     if not working_proxies:
         _emit_status(status_callback, "No proxies passed HTTPS validation.")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text("")
         return [None]
 
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text("\n".join(working_proxies))
     _emit_status(status_callback, f"Found {len(working_proxies)} working proxies.")
 

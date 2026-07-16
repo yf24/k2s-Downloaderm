@@ -36,6 +36,12 @@ MAX_CAPTCHA_ATTEMPTS = 3
 # captcha but nothing happens" hang.
 MAX_URL_BATCH_ROUNDS = 3
 
+# Timeout (seconds) for the getUrl request made while solving the captcha
+# and probing each proxy in generate_download_urls. Deliberately shorter
+# than DEFAULT_TIMEOUT so a single dead proxy doesn't stall the captcha
+# loop for the full 15s before the next iteration is attempted.
+CAPTCHA_SOLVE_TIMEOUT = 5
+
 
 class OperationCancelled(RuntimeError):
     """Raised when the caller requested cancellation via ``stop_event``."""
@@ -169,7 +175,7 @@ def generate_download_urls(
                         "captcha_response": response,
                     },
                     proxies=prox,
-                    timeout=5,
+                    timeout=CAPTCHA_SOLVE_TIMEOUT,
                 ).json()
             except KeyboardInterrupt:
                 raise
