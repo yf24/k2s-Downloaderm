@@ -222,11 +222,20 @@ class Downloader:
         if split_size < 5 * 1024 * 1024:
             raise ValueError("Split size must be at least 5M")
 
+        # Clear the stop flag up front so a cancel issued at any later point
+        # (including during URL generation) is never wiped out.
+        self.stop_event.clear()
+
         if not self.proxies:
             self.refresh_proxies()
 
         file_id = self.extract_file_id(url)
-        original_name = k2s_client.get_name(file_id)
+        try:
+            original_name = k2s_client.get_name(file_id)
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(
+                f"Could not fetch file info from Keep2Share (network unreachable or IP blocked): {exc}"
+            ) from exc
         resolved_name = self._resolve_filename(filename, original_name)
 
         urls = []
@@ -237,16 +246,25 @@ class Downloader:
             except OSError:
                 pass
 
-        urls = k2s_client.generate_download_urls(
-            file_id,
-            count=threads,
-            proxies=self.proxies,
-            captcha_callback=captcha_callback,
-            status_callback=self.status_callback,
-        )
+        try:
+            urls = k2s_client.generate_download_urls(
+                file_id,
+                count=threads,
+                proxies=self.proxies,
+                captcha_callback=captcha_callback,
+                status_callback=self.status_callback,
+                stop_event=self.stop_event,
+            )
+        except k2s_client.OperationCancelled as exc:
+            raise DownloadCancelled(str(exc)) from exc
         self._cache_urls(file_id, urls)
 
-        self.stop_event.clear()
+        if len(urls) < threads:
+            self.log(
+                f"Only {len(urls)} download URLs available; reducing connections from {threads} to {len(urls)}."
+            )
+            threads = len(urls)
+
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
         redownloaded = False
