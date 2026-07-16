@@ -77,23 +77,39 @@ def _emit_status(callback: StatusCallback, message: str) -> None:
 
 
 def parse_size(size: str) -> int:
+    # NOTE: "KB"/"MB"/... here are already binary (1024-based), matching the
+    # IEC units below. "KIB"/"MIB"/... previously used decimal (1000-based)
+    # multipliers, which silently mis-sized any --split-size given in KiB/MiB
+    # (e.g. "5MiB" parsed as 5,000,000 bytes instead of 5,242,880).
+    #
+    # Single-letter units (K/M/G/T) are included because the CLI's own
+    # --split-size default is "20M" (see cli.py); without these aliases,
+    # parse_size("20M") raised an uncaught KeyError -- not the ValueError
+    # cli.py catches -- so the CLI crashed on every invocation that didn't
+    # explicitly pass --split-size.
     units = {
         "B": 1,
+        "K": 2**10,
         "KB": 2**10,
+        "KIB": 2**10,
+        "M": 2**20,
         "MB": 2**20,
+        "MIB": 2**20,
+        "G": 2**30,
         "GB": 2**30,
+        "GIB": 2**30,
+        "T": 2**40,
         "TB": 2**40,
+        "TIB": 2**40,
         "": 1,
-        "KIB": 10**3,
-        "MIB": 10**6,
-        "GIB": 10**9,
-        "TIB": 10**12,
     }
     normalized = str(size).strip()
     match = re.match(r"^([\d\.]+)\s*([a-zA-Z]{0,3})$", normalized)
     if not match:
         raise ValueError(f"Invalid size value: {size}")
     number, unit = float(match.group(1)), match.group(2).upper()
+    if unit not in units:
+        raise ValueError(f"Invalid size value: {size}")
     return int(number * units[unit])
 
 
@@ -130,6 +146,7 @@ class Downloader:
         self.stop_event = threading.Event()
         self._progress_lock = threading.Lock()
         self._proxy_state_lock = threading.Lock()
+        self._working_proxy_lock = threading.Lock()
         self._bytes_downloaded = 0
         self._total_bytes = 0
         self._ranges_total = 0
@@ -188,10 +205,39 @@ class Downloader:
             f"retrying in {backoff:.1f}s."
         )
 
+    def _acquire_proxy_lock(self) -> Optional[int]:
+        """Pick a proxy and atomically acquire its lock.
+
+        Previously this was a check-then-act: scan for a lock that reports
+        ``locked() == False``, then separately call blocking ``acquire()``.
+        Two threads could both observe the same lock as free and race for
+        it; the loser would then block indefinitely inside a blocking
+        ``acquire()`` while still holding its ``url_locks`` slot, and the
+        list of "known working" proxy indexes was read/appended from
+        multiple threads with no lock at all. This instead always attempts
+        a non-blocking acquire and only proceeds once one actually
+        succeeds, and reads ``working_proxy_indexes`` under a dedicated
+        lock. Returns ``None`` if ``stop_event`` is set while waiting.
+        """
+        while not self.stop_event.is_set():
+            with self._working_proxy_lock:
+                known = list(self.working_proxy_indexes)
+            for candidate in known:
+                if self.proxy_locks[candidate].acquire(blocking=False):
+                    return candidate
+
+            candidate = random.randint(0, len(self.proxies) - 1)
+            if self.proxy_locks[candidate].acquire(blocking=False):
+                return candidate
+
+            time.sleep(0.02)
+        return None
+
     def refresh_proxies(self, *, refresh: bool = False) -> None:
         self.proxies = get_working_proxies(refresh=refresh, status_callback=self.status_callback)
         self.proxy_locks = [threading.Lock() for _ in self.proxies]
-        self.working_proxy_indexes = []
+        with self._working_proxy_lock:
+            self.working_proxy_indexes = []
         self._active_proxy_indexes = set()
         self._notify_proxy_state()
 
@@ -386,18 +432,12 @@ class Downloader:
             chunk_start_time = time.time()
             buffer = io.BytesIO()
 
-            proxy_idx = 0
             added_to_active = False
-            for known in self.working_proxy_indexes:
-                if not self.proxy_locks[known].locked():
-                    proxy_idx = known
-                    break
-                proxy_idx = random.randint(0, len(self.proxies) - 1)
+            proxy_idx = self._acquire_proxy_lock()
+            if proxy_idx is None:
+                stop = True
+                return
 
-            while self.proxy_locks[proxy_idx].locked():
-                proxy_idx = random.randint(0, len(self.proxies) - 1)
-
-            self.proxy_locks[proxy_idx].acquire()
             proxy_value = self.proxies[proxy_idx]
             prox = {"https": f"http://{proxy_value}"} if proxy_value else None
             added_to_active = True
@@ -451,8 +491,11 @@ class Downloader:
 
                 range_meta.pop("last_error", None)
                 tmp_filename.write_bytes(buffer.getvalue())
-                if proxy_idx not in self.working_proxy_indexes:
-                    self.working_proxy_indexes.append(proxy_idx)
+                with self._working_proxy_lock:
+                    is_newly_known = proxy_idx not in self.working_proxy_indexes
+                    if is_newly_known:
+                        self.working_proxy_indexes.append(proxy_idx)
+                if is_newly_known:
                     self._notify_proxy_state()
 
                 range_meta["inUse"] = False
@@ -566,20 +609,30 @@ class Downloader:
 
     @staticmethod
     def _build_ranges(total_value: int, split_count: int) -> Dict[str, Dict[str, object]]:
+        """Split ``[0, total_value)`` into ``split_count`` contiguous byte ranges.
+
+        Each boundary is derived from the previous range's end (cumulative),
+        not recomputed independently per range. The old implementation
+        rounded ``start``/``end`` separately for every range, which could
+        leave a 1-byte gap or overlap between adjacent ranges depending on
+        ``total_value``/``split_count`` -- silently corrupting the
+        reassembled file, since a gap byte is never downloaded and an
+        overlap byte gets written twice.
+        """
         range_dict: Dict[str, Dict[str, object]] = {}
+        start = 0
         for i in range(split_count):
-            start = int(round(1 + i * total_value / (split_count * 1.0), 0))
-            end = int(round(1 + i * total_value / (split_count * 1.0) + total_value / (split_count * 1.0) - 1, 0))
+            if i == split_count - 1:
+                end = total_value - 1
+            else:
+                end = int(round((i + 1) * total_value / split_count)) - 1
             range_dict[str(i)] = {
                 "inUse": False,
                 "downloaded": False,
                 "range": f"{start}-{end}",
                 "bytes": end - start + 1,
             }
-        first = range_dict["0"]
-        _, end = str(first["range"]).split("-")
-        first["range"] = f"0-{end}"
-        first["bytes"] = int(first["bytes"]) + 1
+            start = end + 1
         return range_dict
 
     @staticmethod

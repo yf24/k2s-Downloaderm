@@ -10,31 +10,32 @@
 
 ## P0 — 正確性缺陷（會造成資料損毀、掛死或誤殺 process）
 
-- [ ] **P0-1 `parse_size` 的 IEC 單位換算錯誤**
-  - 位置：`src/k2s_downloader/core/downloader.py:79`（`units` 對照表）
-  - 問題：`KIB/MIB/GIB/TIB` 被定義成 10 的次方（`10**3, 10**6, ...`），但 KiB/MiB 應為 2 的次方。
-    例如 `--split-size 20MiB` 會被算成 20,000,000 bytes；`5MiB` 更會低於 `download()` 的
-    5 MiB 下限而直接丟出 `ValueError`。
-  - 建議：`KIB=2**10, MIB=2**20, GIB=2**30, TIB=2**40`；同時補 `parse_size` 的邊界單元測試（見 P3-1）。
+- [x] **P0-1 `parse_size` 的 IEC 單位換算錯誤**（2026-07-16 完成）
+  - 位置：`src/k2s_downloader/core/downloader.py`（`parse_size`）
+  - 修法：`KIB/MIB/GIB/TIB` 改為 2 的次方，與既有的（同樣是二進位的）`KB/MB/GB/TB` 一致。
+  - **額外發現並修復**：CLI 的 `--split-size` 預設值是字串 `"20M"`，但原本的 `units` dict 只有
+    `"MB"` 沒有單獨的 `"M"`，導致 `parse_size("20M")` 丟出未被 `cli.py` 捕捉的 `KeyError`
+    （`cli.py` 只 catch `ValueError`）── **也就是說只要使用者沒有明確加 `--split-size`，CLI 就會直接崩潰**。
+    已補上 `K/M/G/T` 單字母別名，並把「未知單位」的例外從 `KeyError` 改為 `ValueError`。
+  - 測試：`tests/test_downloader_units_and_ranges.py::TestParseSizeBinaryUnits`（含 P3-1 全部項目）。
 
-- [ ] **P0-2 `_build_ranges` 切段可能產生間隙／重疊 → 合併後檔案損毀**
-  - 位置：`src/k2s_downloader/core/downloader.py:549`（`_build_ranges`）
-  - 問題：每段的 `start` 與 `end` 各自獨立 `round()`，相鄰段之間不保證「前段 end+1 == 後段 start」，
-    大檔在特定 `split_count` 下可能漏 1 byte 或重疊。
-  - 建議：改用累進切法（`start = prev_end + 1`，最後一段 `end = total-1`），確保完整覆蓋且不重疊；
-    以單元測試驗證「所有段 bytes 總和 == total_size 且連續」（見 P3-2）。
+- [x] **P0-2 `_build_ranges` 切段可能產生間隙／重疊 → 合併後檔案損毀**（2026-07-16 完成）
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_build_ranges`）
+  - 修法：改為累進切法（`start = 前段 end + 1`，最後一段強制 `end = total_value - 1`），
+    確保所有段連續、無重疊、bytes 總和恆等於 `total_size`。
+  - 測試：`tests/test_downloader_units_and_ranges.py::TestBuildRangesContiguity`（多組含質數邊界的 `total_size`/`split_count`，見 P3-2）。
 
-- [ ] **P0-3 proxy lock 的 TOCTOU 與 blocking `acquire` → 潛在死結／卡住**
-  - 位置：`src/k2s_downloader/core/downloader.py:371`–`388`（`download_chunk` 內選 proxy）
-  - 問題：`while proxy_locks[idx].locked(): 換一個` 為 check-then-act，兩個 thread 可同時通過檢查後，
-    其中一個在 `proxy_locks[idx].acquire()`（預設 blocking）永久阻塞，且它此時仍持有 `url_lock` 不放。
-    proxy 數量少而 threads 多時更容易發生。
-  - 建議：改用 `acquire(blocking=False)` 的迴圈（搭配上限次數或短暫 sleep），取不到就放掉 `url_lock` 回排程。
+- [x] **P0-3 proxy lock 的 TOCTOU 與 blocking `acquire` → 潛在死結／卡住**（2026-07-16 完成）
+  - 位置：`src/k2s_downloader/core/downloader.py`（新增 `_acquire_proxy_lock`，取代 `download_chunk` 內原本的選 proxy 邏輯）
+  - 修法：不再「檢查 `.locked()` 後再呼叫 blocking `.acquire()`」，改為統一用 `acquire(blocking=False)`
+    的迴圈（取不到就 `time.sleep(0.02)` 後重試），並在偵測到 `stop_event` 時提前返回 `None` 中止等待。
+  - 測試：`tests/test_downloader_units_and_ranges.py::TestAcquireProxyLockConcurrencySafety`
+    （12 threads 搶 3 個 proxy lock 驗證互斥、cancel 後能在 1 秒內脫離等待）。
 
-- [ ] **P0-4 `working_proxy_indexes` 多執行緒無鎖寫入 → race condition**
-  - 位置：`src/k2s_downloader/core/downloader.py:436`（`.append()`），讀取於 `:373`
-  - 問題：多個 daemon threads 同時 `append`/讀取同一個 list，無鎖保護。
-  - 建議：以既有的 `self._proxy_state_lock`（或新增鎖）保護；或改用 thread-safe 結構。
+- [x] **P0-4 `working_proxy_indexes` 多執行緒無鎖寫入 → race condition**（2026-07-16 完成）
+  - 位置：`src/k2s_downloader/core/downloader.py`（`__init__` 新增 `_working_proxy_lock`；
+    `_acquire_proxy_lock` 讀取、`download_chunk` 內 append、`refresh_proxies` 重置皆已上鎖）
+  - 測試：`tests/test_downloader_units_and_ranges.py::test_working_proxy_indexes_append_is_race_free`。
 
 - [x] **P0-5 `generate_download_urls` 的無界迴圈 → 掛死**（2026-07-16 完成）
   - 位置：`src/k2s_downloader/core/k2s_client.py`（`generate_download_urls`）
@@ -101,10 +102,10 @@
 
 ## P3 — 測試覆蓋
 
-- [ ] **P3-1 `parse_size` 邊界測試**（鎖住 P0-1 修正）
-  - 涵蓋 `B/KB/MB/GB` 與 `KiB/MiB/GiB`、無單位、非法輸入。
-- [ ] **P3-2 `_build_ranges` 連續性測試**（鎖住 P0-2 修正）
-  - 驗證多種 `total_size` × `split_count`：各段連續、無重疊、bytes 總和等於 total。
+- [x] **P3-1 `parse_size` 邊界測試**（2026-07-16 完成，隨 P0-1 一併補上）
+  - 涵蓋 `B/KB/MB/GB`、`KiB/MiB/GiB`、單字母 `K/M/G/T`、CLI 預設值 `"20M"`、無單位、非法輸入。
+- [x] **P3-2 `_build_ranges` 連續性測試**（2026-07-16 完成，隨 P0-2 一併補上）
+  - 多組 `total_size` × `split_count`（含質數邊界）：驗證各段連續、無重疊、bytes 總和等於 total。
 - [x] **P3-3 `generate_download_urls` captcha / 重試分支測試**（2026-07-16 完成，隨 P0-5/P0-6 一併補上）
   - 見 `tests/test_k2s_client_blocked.py`：invalid captcha 上限、File not found、
     全部 getUrl 失敗、部分成功回傳 partial、stop_event 取消、threads 收斂。
@@ -139,9 +140,11 @@
 
 ## 建議處理順序
 
-1. 先做 **P0-1、P0-2** 並同步補 **P3-1、P3-2**（純函式、好測、風險高）。
-2. 再處理併發相關 **P0-3、P0-4** 與掛死相關 **P0-5、P0-6**。
-3. 接著 **P1**（依賴／CI／文件入口）讓專案可持續驗證。
+1. ~~先做 **P0-1、P0-2** 並同步補 **P3-1、P3-2**（純函式、好測、風險高）。~~ ✅ 已完成
+2. ~~再處理併發相關 **P0-3、P0-4** 與掛死相關 **P0-5、P0-6**。~~ ✅ 已完成 — **P0 全部 6 項皆已修復**
+3. 接著 **P1**（依賴／CI／文件入口）讓專案可持續驗證。← 下一步建議從這裡開始
 4. 之後依 P2 → P4 → P5 逐步推進。
 
-> 註：以上為「檢視提案」，尚未動任何程式碼。接手 session 請逐項認領、附上測試，並在對應項目更新狀態。
+> 註：P0 全項（P0-1 ~ P0-6）與對應測試（P3-1、P3-2、P3-3）已於 2026-07-16 完成並合併於
+> commit 內；分支 `fix/blocked-ip-error-handling` 已推送。所有測試（本機 `.venv`，
+> `PYTHONPATH=src pytest tests`）共 55 個全數通過。接手 session 請從 **P1** 開始逐項認領。
