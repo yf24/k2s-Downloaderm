@@ -55,26 +55,25 @@
 
 ## P1 — 專案基礎建設與依賴正確性
 
-- [ ] **P1-1 移除未使用的 runtime 依賴 `aiohttp`**
-  - 位置：`pyproject.toml:17`
-  - 問題：整個程式碼庫從未 `import aiohttp`（已 grep 確認），卻列為 runtime dependency。
-  - 建議：直接刪除，縮小安裝體積。
+- [x] **P1-1 移除未使用的 runtime 依賴 `aiohttp`**（2026-07-16 完成）
+  - 已自 `pyproject.toml` 的 dependencies 移除。
+  - 附帶：`src/k2s_downloader.egg-info/`（建置產物，`requires.txt` 殘留過時依賴資訊）已自版控移除，
+    `.gitignore` 原本就有排除規則。
 
-- [ ] **P1-2 `pyinstaller` 不應是 runtime 依賴**
-  - 位置：`pyproject.toml:18`
-  - 問題：打包工具被放進 `[project].dependencies`，一般使用者安裝會被迫拉入。
-  - 建議：移到 optional group（例如 `[project.optional-dependencies].build`）或 dev。
+- [x] **P1-2 `pyinstaller` 不應是 runtime 依賴**（2026-07-16 完成）
+  - 已移到 `[project.optional-dependencies].build`（`pip install -e ".[build]"`）。
 
-- [ ] **P1-3 缺少 test / lint 的 CI**
-  - 位置：`.github/workflows/`（目前只有 `ai-review.yml`）
-  - 問題：沒有自動跑 `pytest` 與 `ruff` 的 workflow，回歸無法把關。
-  - 建議：新增 `ci.yml`，於 push / PR 執行 `pytest -q` 與 `ruff check`。
+- [x] **P1-3 缺少 test / lint 的 CI**（2026-07-16 完成）
+  - 新增 `.github/workflows/ci.yml`：push（main）/ PR 觸發，Python 3.9 與 3.13 matrix，
+    執行 `ruff check .` 與 `pytest -q`。
+  - 同時修掉 ruff 揪出的 2 個 unused import（`cli.py` 的 `Path`、`.github/scripts/test_ai_review.py` 的 `os`），
+    確保 CI 首次執行即綠燈（本機已驗證：ruff 全過、55 tests 全過）。
+  - 附帶（P5-2 部分完成）：`pyproject.toml` 加入 `[tool.pytest.ini_options]`
+    （`testpaths` + `pythonpath = ["src"]`，本機直接跑 `pytest` 免設 PYTHONPATH）與 `[tool.ruff]` 基本設定。
 
-- [ ] **P1-4 Readme 的「Legacy Entry Points」指向不存在的 `main.py`**
-  - 位置：`Readme.md`（Legacy Entry Points 段）
-  - 問題：宣稱 `python main.py` 仍可用，但專案無 `main.py`；實際入口為 `python -m k2s_downloader`
-    （`src/k2s_downloader/__main__.py`）與 `k2s_gui_entry.py`。
-  - 建議：更正為實際入口，或補上相容 shim。
+- [x] **P1-4 Readme 的「Legacy Entry Points」指向不存在的 `main.py`**（2026-07-16 完成）
+  - 改為「Alternative Entry Points」段，記載實際入口 `python -m k2s_downloader` 與 `k2s_gui_entry.py`，
+    並新增「Development」段說明 dev 安裝、pytest、ruff 與 CI。
 
 ---
 
@@ -133,7 +132,7 @@
 
 - [ ] **P5-1 建立 canonical 文件**（依全域規範 `requirements-en.md` 含 AC、`readme-en.md` 架構）
   - 中英雙語同步：`*-en.md`（AI/canonical）＋ `*-zh.md`（human-facing）。
-- [ ] **P5-2 補齊 tooling 設定**：`pyproject.toml` 加入 `[tool.ruff]` / `[tool.pytest.ini_options]`，新增 `CONTRIBUTING`。
+- [~] **P5-2 補齊 tooling 設定**：~~`pyproject.toml` 加入 `[tool.ruff]` / `[tool.pytest.ini_options]`~~（已隨 P1-3 完成）；尚餘：新增 `CONTRIBUTING`。
 - [ ] **P5-3 Readme 補充**：proxy/captcha 實際行為、法律與使用聲明、`.[dev]` 安裝與測試說明。
 
 ---
@@ -142,8 +141,8 @@
 
 1. ~~先做 **P0-1、P0-2** 並同步補 **P3-1、P3-2**（純函式、好測、風險高）。~~ ✅ 已完成
 2. ~~再處理併發相關 **P0-3、P0-4** 與掛死相關 **P0-5、P0-6**。~~ ✅ 已完成 — **P0 全部 6 項皆已修復**
-3. 接著 **P1**（依賴／CI／文件入口）讓專案可持續驗證。← 下一步建議從這裡開始
-4. 之後依 P2 → P4 → P5 逐步推進。
+3. ~~接著 **P1**（依賴／CI／文件入口）讓專案可持續驗證。~~ ✅ 已完成（P1-1 ~ P1-4 全數完成）
+4. 之後依 P2 → P4 → P5 逐步推進。← 下一步建議從 **P2**（錯誤處理與健壯性）開始
 
 > 註：P0 全項（P0-1 ~ P0-6）與對應測試（P3-1、P3-2、P3-3）已於 2026-07-16 完成並合併於
 > commit 內；分支 `fix/blocked-ip-error-handling` 已推送。所有測試（本機 `.venv`，

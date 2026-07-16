@@ -14,14 +14,15 @@ dependencies = [
     "Pillow",
     "requests-futures",
     "PySide6",
-    "aiohttp>=3.12.15",
-    "pyinstaller>=6.16.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ruff",
+]
+build = [
+    "pyinstaller>=6.16.0",
 ]
 
 [project.scripts]
@@ -33,3 +34,14 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Allow running `pytest` against the src layout without installing the
+# package first (CI still does an editable install to validate packaging).
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+extend-exclude = ["src/k2s_downloader.egg-info"]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from .core.downloader import DownloadCancelled, Downloader, parse_size
 

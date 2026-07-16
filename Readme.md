@@ -36,5 +36,17 @@ uv run -- python -m k2s_downloader.gui.app
 ```
 Provide the K2S link inside the application, optionally override the output filename, adjust the thread count and split size, then start the download. Captcha prompts appear inline.
 
-## Legacy Entry Points
-For compatibility, running python main.py ... still forwards to the CLI entry point.
+## Alternative Entry Points
+Without the console scripts, the same entry points are reachable as plain modules/scripts:
+```
+uv run python -m k2s_downloader <k2s_url> [options]   # CLI
+uv run python k2s_gui_entry.py                        # GUI
+```
+
+## Development
+```
+uv sync --extra dev        # or: pip install -e ".[dev]"
+uv run pytest -q           # run the test suite
+uv run ruff check .        # lint
+```
+Both checks also run automatically in CI (`.github/workflows/ci.yml`) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller.
