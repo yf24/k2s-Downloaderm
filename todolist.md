@@ -140,8 +140,9 @@
   - 位置：`downloader.py`（原 `_download_once`，約 280 行）
   - 修法：拆成 5 個獨立 method —
     `_fetch_total_size`（HEAD 請求＋Content-Length 解析）、
-    `_report_progress`（進度回報，`progress_bar` 改為明確參數而非 closure 捕捉）、
-    `_download_chunk`（原本的 `download_chunk` nested closure，改為正式 method，透過 `threading.Thread(target=self._download_chunk, kwargs={...})` 呼叫）、
+    `_report_progress`（進度回報，`progress_bar` 隨 `_DownloadContext` 明確傳遞而非 closure 捕捉）、
+    `_download_chunk`（原本的 `download_chunk` nested closure，改為正式 method；依 PR #7 review 建議，
+    共用參數封裝成 frozen dataclass `_DownloadContext` 傳遞，避免 9 參數的過長簽名）、
     `_run_scheduling_loop`（排程／派工迴圈，回傳 `failed_chunk`）、
     `_merge_parts`（合併 part 檔案為最終檔案）。
     `_download_once` 現在只負責串接這幾個 method，本身縮到約 40 行。

@@ -9,8 +9,9 @@ import re
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import requests
 from shutil import which
@@ -55,6 +56,24 @@ CHUNK_REQUEST_TIMEOUT = 20
 # same value as CHUNK_REQUEST_TIMEOUT today, but they control different
 # things and are kept as separate constants.
 CHUNK_STALL_TIMEOUT = 20
+
+
+@dataclass(frozen=True)
+class _DownloadContext:
+    """Per-`_download_once`-invocation values shared by every chunk thread.
+
+    Bundled into one immutable object so `_run_scheduling_loop` /
+    `_download_chunk` / `_report_progress` don't each need to thread five
+    separate keyword arguments through (the signatures got unwieldy when
+    these were split out of the old monolithic `_download_once`).
+    """
+
+    urls: Sequence[str]
+    filename: str
+    headers: Dict[str, str]
+    threads: int
+    split_count: int
+    progress_bar: tqdm
 
 
 class DownloadCancelled(RuntimeError):
@@ -411,7 +430,7 @@ class Downloader:
             total_size = total_size + 2**32
         return total_size
 
-    def _report_progress(self, delta: int, progress_bar: tqdm) -> None:
+    def _report_progress(self, delta: int, ctx: _DownloadContext) -> None:
         if delta == 0:
             return
         with self._progress_lock:
@@ -420,29 +439,24 @@ class Downloader:
             done = self._done_count
         if self.progress_callback:
             self.progress_callback(downloaded, self._total_bytes, done, self._ranges_total)
-        if not progress_bar.disable:
-            progress_bar.update(delta)
+        if not ctx.progress_bar.disable:
+            ctx.progress_bar.update(delta)
 
     def _download_chunk(
         self,
         index: str,
         range_meta: Dict[str, object],
         thread_index: int,
-        *,
-        urls: Sequence[str],
-        filename: str,
-        headers: Dict[str, str],
-        split_count: int,
-        progress_bar: tqdm,
+        ctx: _DownloadContext,
     ) -> None:
         """Download a single byte-range chunk in its own thread.
 
         Cancellation is communicated purely via ``self.stop_event`` -- there
         used to also be a ``nonlocal stop`` flag mirrored from here into the
-        scheduling loop in ``_download_once``, but every path that set it
-        did so only when ``self.stop_event`` was already set (or being set
-        in the same statement), making it entirely redundant with -- and a
-        source of unnecessary shared mutable state across threads compared
+        scheduling loop (now ``_run_scheduling_loop``), but every path that
+        set it did so only when ``self.stop_event`` was already set (or being
+        set in the same statement), making it entirely redundant with -- and
+        a source of unnecessary shared mutable state across threads compared
         to -- checking ``self.stop_event`` directly.
         """
         if self.stop_event.is_set():
@@ -450,7 +464,7 @@ class Downloader:
 
         chunk_range = range_meta["range"]  # type: ignore[index]
         expected_bytes = int(range_meta["bytes"])  # type: ignore[arg-type]
-        tmp_filename = self.tmp_dir / f"{filename}.part{str(index).zfill(len(str(split_count)))}"
+        tmp_filename = self.tmp_dir / f"{ctx.filename}.part{str(index).zfill(len(str(ctx.split_count)))}"
 
         chunk_start_time = time.time()
         buffer = io.BytesIO()
@@ -478,8 +492,8 @@ class Downloader:
         try:
             try:
                 response = requests.get(
-                    urls[thread_index],
-                    headers={"Range": f"bytes={chunk_range}", "User-Agent": headers["User-Agent"]},
+                    ctx.urls[thread_index],
+                    headers={"Range": f"bytes={chunk_range}", "User-Agent": ctx.headers["User-Agent"]},
                     stream=True,
                     proxies=prox,
                     timeout=CHUNK_REQUEST_TIMEOUT,
@@ -506,7 +520,7 @@ class Downloader:
                         break
                     chunk_start_time = time.time()
                     buffer.write(data)
-                    self._report_progress(len(data), progress_bar)
+                    self._report_progress(len(data), ctx)
             except requests.exceptions.RequestException as exc:
                 # Network-level failure (connection error, read timeout,
                 # a chunked-encoding error mid-stream, etc.). Previously
@@ -522,7 +536,7 @@ class Downloader:
 
             chunk_bytes = len(buffer.getvalue())
             if not math.isclose(chunk_bytes, expected_bytes, abs_tol=1):
-                self._report_progress(-chunk_bytes, progress_bar)
+                self._report_progress(-chunk_bytes, ctx)
                 self._mark_chunk_failed(
                     range_meta, f"size mismatch: got {chunk_bytes} expected {expected_bytes}"
                 )
@@ -545,8 +559,8 @@ class Downloader:
             with self._progress_lock:
                 self._done_count += 1
                 done = self._done_count
-            if not progress_bar.disable:
-                progress_bar.desc = f"[{done}/{self._ranges_total}] Downloaded"
+            if not ctx.progress_bar.disable:
+                ctx.progress_bar.desc = f"[{done}/{self._ranges_total}] Downloaded"
             if self.progress_callback:
                 self.progress_callback(self._bytes_downloaded, self._total_bytes, done, self._ranges_total)
         except Exception as exc:  # noqa: BLE001 - a chunk thread must never crash
@@ -571,22 +585,17 @@ class Downloader:
     def _run_scheduling_loop(
         self,
         ranges: Dict[str, Dict[str, object]],
-        *,
-        urls: Sequence[str],
-        filename: str,
-        headers: Dict[str, str],
-        threads: int,
-        split_count: int,
-        progress_bar: tqdm,
-    ) -> Optional[tuple]:
+        ctx: _DownloadContext,
+    ) -> Optional[Tuple[str, str, int]]:
         """Dispatch a download thread for each pending range until all are
         done, cancelled, or one has permanently failed.
 
-        Returns the ``failed_chunk`` tuple (idx, reason, attempts) if a
-        range exhausted its retry budget, or ``None`` otherwise. Cancellation
-        is reported by the caller checking ``self.stop_event`` afterward.
+        Returns a ``(chunk_idx, last_error_reason, attempt_count)`` tuple if
+        a range exhausted its retry budget, or ``None`` otherwise (both on
+        full success and on cancellation -- the caller distinguishes the
+        latter by checking ``self.stop_event`` afterward).
         """
-        failed_chunk: Optional[tuple] = None
+        failed_chunk: Optional[Tuple[str, str, int]] = None
         stop_scheduling = False
 
         try:
@@ -599,7 +608,11 @@ class Downloader:
                         stop_scheduling = True
                         break
                     if meta.get("failed"):
-                        failed_chunk = (idx, meta.get("last_error", "unknown error"), meta.get("attempts", 0))
+                        failed_chunk = (
+                            idx,
+                            str(meta.get("last_error", "unknown error")),
+                            int(meta.get("attempts", 0)),  # type: ignore[arg-type]
+                        )
                         stop_scheduling = True
                         break
                     if meta["inUse"] or meta["downloaded"]:
@@ -610,37 +623,30 @@ class Downloader:
                         # source again immediately.
                         continue
 
-                    part_path = self.tmp_dir / f"{filename}.part{str(idx).zfill(len(str(split_count)))}"
+                    part_path = self.tmp_dir / f"{ctx.filename}.part{str(idx).zfill(len(str(ctx.split_count)))}"
                     if part_path.exists():
                         existing = part_path.read_bytes()
                         if math.isclose(len(existing), meta["bytes"], abs_tol=1):
                             if not meta["downloaded"]:
-                                self._report_progress(int(meta["bytes"]), progress_bar)
+                                self._report_progress(int(meta["bytes"]), ctx)
                                 meta["downloaded"] = True
                                 with self._progress_lock:
                                     self._done_count += 1
                                     done = self._done_count
-                                if not progress_bar.disable:
-                                    progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
+                                if not ctx.progress_bar.disable:
+                                    ctx.progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
                                 continue
                         else:
                             part_path.unlink()
 
-                    for thread_index in range(threads):
+                    for thread_index in range(ctx.threads):
                         if self.url_locks[thread_index].locked():
                             continue
                         self.url_locks[thread_index].acquire()
                         meta["inUse"] = True
                         threading.Thread(
                             target=self._download_chunk,
-                            args=(idx, meta, thread_index),
-                            kwargs=dict(
-                                urls=urls,
-                                filename=filename,
-                                headers=headers,
-                                split_count=split_count,
-                                progress_bar=progress_bar,
-                            ),
+                            args=(idx, meta, thread_index, ctx),
                             daemon=True,
                         ).start()
                         break
@@ -694,27 +700,26 @@ class Downloader:
         self._ranges_total = len(ranges)
         self.url_locks = [threading.Lock() for _ in range(threads)]
 
-        progress_bar = tqdm(
-            desc=f"[0/{len(ranges)}] Downloaded",
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-            disable=not self.show_console_progress,
+        ctx = _DownloadContext(
+            urls=urls,
+            filename=filename,
+            headers=headers,
+            threads=threads,
+            split_count=split_count,
+            progress_bar=tqdm(
+                desc=f"[0/{len(ranges)}] Downloaded",
+                total=total_size,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+                disable=not self.show_console_progress,
+            ),
         )
 
         try:
-            failed_chunk = self._run_scheduling_loop(
-                ranges,
-                urls=urls,
-                filename=filename,
-                headers=headers,
-                threads=threads,
-                split_count=split_count,
-                progress_bar=progress_bar,
-            )
+            failed_chunk = self._run_scheduling_loop(ranges, ctx)
         finally:
-            progress_bar.close()
+            ctx.progress_bar.close()
 
         if failed_chunk is not None:
             idx, reason, attempts = failed_chunk
