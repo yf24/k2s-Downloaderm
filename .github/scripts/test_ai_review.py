@@ -10,7 +10,6 @@ ai-review workflow 中安裝，不屬於本專案的主要相依套件），
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 
 import pytest

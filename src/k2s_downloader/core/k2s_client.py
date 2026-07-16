@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sys
+import threading
 import time
 from concurrent.futures import as_completed
 from io import BytesIO
@@ -23,6 +23,31 @@ DOMAINS = ["k2s.cc"]
 # Without a timeout, a blocked/black-holed IP causes requests to hang
 # indefinitely, which is what makes the CLI/GUI appear to freeze.
 DEFAULT_TIMEOUT = 15
+
+# How many captcha solves the user gets before we give up. Previously an
+# "Invalid captcha code" response re-prompted forever, so a blocked IP whose
+# captcha submissions were being rejected looked like an app that "does
+# nothing" after entering the captcha.
+MAX_CAPTCHA_ATTEMPTS = 3
+
+# How many consecutive batch rounds of getUrl may yield zero new URLs before
+# we conclude the key/proxy is blocked. Previously ``while len(urls) < count``
+# spun forever when every request failed, which was the main "entered the
+# captcha but nothing happens" hang.
+MAX_URL_BATCH_ROUNDS = 3
+
+
+class OperationCancelled(RuntimeError):
+    """Raised when the caller requested cancellation via ``stop_event``."""
+
+
+class K2SFileNotFound(RuntimeError):
+    """Raised when the Keep2Share API reports the file does not exist."""
+
+
+def _raise_if_cancelled(stop_event: Optional[threading.Event]) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise OperationCancelled("Cancelled while generating download URLs")
 
 
 def _emit_status(callback: StatusCallback, message: str) -> None:
@@ -91,8 +116,16 @@ def generate_download_urls(
     proxies: Optional[Sequence[Optional[str]]] = None,
     captcha_callback: Optional[CaptchaCallback] = None,
     status_callback: StatusCallback = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> List[str]:
-    """Collect temporary download URLs for the given file identifier."""
+    """Collect temporary download URLs for the given file identifier.
+
+    ``stop_event`` (if given) is checked between network operations so the
+    caller can abort this phase; previously cancellation only took effect
+    once the actual chunk download had started.
+    """
+
+    _raise_if_cancelled(stop_event)
 
     proxy_pool: Sequence[Optional[str]]
     if proxies is None:
@@ -108,17 +141,25 @@ def generate_download_urls(
     working_link = False
     free_download_key = ""
     urls: List[str] = []
+    captcha_attempts = 1
 
-    captcha = fetch_captcha(status_callback)
-    captcha_image = requests.get(captcha["captcha_url"], timeout=DEFAULT_TIMEOUT).content
+    try:
+        captcha = fetch_captcha(status_callback)
+        captcha_image = requests.get(captcha["captcha_url"], timeout=DEFAULT_TIMEOUT).content
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"Could not fetch a captcha challenge (network unreachable or IP blocked): {exc}"
+        ) from exc
     response = captcha_callback(captcha_image, captcha["challenge"], captcha["captcha_url"])
 
     for proxy in proxy_pool:
+        _raise_if_cancelled(stop_event)
         label = proxy or "LOCAL"
         _emit_status(status_callback, f"Trying proxy {label}")
         prox = {"https": f"http://{proxy}"} if proxy else None
 
         while not working_link:
+            _raise_if_cancelled(stop_event)
             try:
                 free_r = requests.post(
                     f"https://{choice(DOMAINS)}/api/v2/getUrl",
@@ -132,19 +173,32 @@ def generate_download_urls(
                 ).json()
             except KeyboardInterrupt:
                 raise
-            except Exception:
+            except Exception as exc:
+                _emit_status(status_callback, f"[{label}] request failed ({exc}); trying next proxy.")
                 break
 
             if free_r.get("status") == "error":
                 message = free_r.get("message", "")
                 if message == "Invalid captcha code":
-                    _emit_status(status_callback, "Captcha invalid, requesting a new one.")
+                    if captcha_attempts >= MAX_CAPTCHA_ATTEMPTS:
+                        raise RuntimeError(
+                            f"Captcha rejected {captcha_attempts} times. If the answers were "
+                            "correct, your IP is likely blocked or rate-limited by Keep2Share."
+                        )
+                    captcha_attempts += 1
+                    _emit_status(
+                        status_callback,
+                        f"Captcha invalid, requesting a new one "
+                        f"(attempt {captcha_attempts}/{MAX_CAPTCHA_ATTEMPTS}).",
+                    )
                     captcha = fetch_captcha(status_callback)
                     captcha_image = requests.get(captcha["captcha_url"], timeout=DEFAULT_TIMEOUT).content
                     response = captcha_callback(captcha_image, captcha["challenge"], captcha["captcha_url"])
                     continue
                 if message == "File not found":
-                    sys.exit("File not found")
+                    raise K2SFileNotFound(
+                        "File not found on Keep2Share (it may have been removed or the link is wrong)."
+                    )
 
             if "time_wait" not in free_r:
                 free_download_key = free_r.get("free_download_key", "")
@@ -156,6 +210,7 @@ def generate_download_urls(
                 break
 
             for remaining in range(wait_time - 1, 0, -1):
+                _raise_if_cancelled(stop_event)
                 _emit_status(status_callback, f"[{label}] Waiting {remaining} seconds...")
                 time.sleep(1)
 
@@ -167,7 +222,9 @@ def generate_download_urls(
 
         session = FuturesSession(max_workers=5)
 
+        rounds_without_progress = 0
         while len(urls) < count:
+            _raise_if_cancelled(stop_event)
             futures = []
             to_generate = count - len(urls)
             for _ in range(to_generate):
@@ -182,19 +239,49 @@ def generate_download_urls(
             iterator = as_completed(futures)
             iterator = tqdm(iterator, total=len(futures), leave=False, disable=status_callback is not None)
 
+            gained = 0
             for future in iterator:
                 try:
                     result = future.result()
                     urls.append(result.json()["url"])
+                    gained += 1
                 except KeyboardInterrupt:
                     raise
                 except Exception:
                     continue
 
+            if gained == 0:
+                rounds_without_progress += 1
+                if rounds_without_progress >= MAX_URL_BATCH_ROUNDS:
+                    _emit_status(
+                        status_callback,
+                        f"[{label}] No new download URLs after {MAX_URL_BATCH_ROUNDS} rounds; "
+                        "this proxy/IP is likely blocked.",
+                    )
+                    break
+            else:
+                rounds_without_progress = 0
+
+        if not urls:
+            _emit_status(status_callback, f"[{label}] Could not generate any download URLs; trying next proxy.")
+            working_link = False
+            free_download_key = ""
+            continue
+
         break
 
     if not urls:
-        raise RuntimeError("No working links found")
+        raise RuntimeError(
+            "No working download URLs could be generated. Your IP and every proxy tried appear "
+            "to be blocked or rate-limited by Keep2Share. Try refreshing the proxy list or "
+            "waiting a while before retrying."
+        )
+
+    if len(urls) < count:
+        _emit_status(
+            status_callback,
+            f"Only generated {len(urls)}/{count} download URLs; continuing with fewer connections.",
+        )
 
     return urls[:count]
 
