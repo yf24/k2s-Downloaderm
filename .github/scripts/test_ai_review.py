@@ -1,7 +1,7 @@
 """Unit tests for .github/scripts/ai_review.py.
 
 只測試不需要真正呼叫 GitHub / Anthropic API 的純邏輯部分：
-必要環境變數的讀取行為，以及 AI 模型是否被限制在 claude-3-5-haiku。
+必要環境變數的讀取行為，以及 AI 模型是否被限制在 claude-haiku-4-5。
 
 若執行環境未安裝 anthropic / PyGithub（這兩個套件只在 CI 的
 ai-review workflow 中安裝，不屬於本專案的主要相依套件），
@@ -49,5 +49,10 @@ class TestGetRequiredEnv:
 
 
 class TestModelRestriction:
+    # Explicit allow-list of exact model IDs, not a startswith check: a
+    # startswith check would also pass for an unintended variant like
+    # "claude-haiku-4-5-extended".
+    ALLOWED_MODELS = {"claude-haiku-4-5"}
+
     def test_allowed_model_is_claude_haiku_4_5(self):
-        assert ai_review.ALLOWED_MODEL.startswith("claude-haiku-4-5")
+        assert ai_review.ALLOWED_MODEL in self.ALLOWED_MODELS
