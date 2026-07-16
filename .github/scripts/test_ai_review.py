@@ -49,7 +49,10 @@ class TestGetRequiredEnv:
 
 
 class TestModelRestriction:
+    # Explicit allow-list of exact model IDs, not a startswith check: a
+    # startswith check would also pass for an unintended variant like
+    # "claude-haiku-4-5-extended".
+    ALLOWED_MODELS = {"claude-haiku-4-5"}
+
     def test_allowed_model_is_claude_haiku_4_5(self):
-        # Exact match, not startswith: a startswith check would also pass
-        # for an unintended variant like "claude-haiku-4-5-extended".
-        assert ai_review.ALLOWED_MODEL == "claude-haiku-4-5"
+        assert ai_review.ALLOWED_MODEL in self.ALLOWED_MODELS
