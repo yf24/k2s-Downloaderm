@@ -9,9 +9,9 @@ import os
 from anthropic import Anthropic
 from github import Github
 
-# 限制使用的 AI 模型為 Claude 3.5 Haiku，避免因設定被誤改而呼叫到
-# 成本更高或尚未驗證過的模型。
-ALLOWED_MODEL = "claude-3-5-haiku-20241022"
+# 限制使用的 AI 模型為 Claude Haiku 4.5（claude-3-5-haiku-20241022 已於
+# 2026-02-19 下架），避免因設定被誤改而呼叫到成本更高或尚未驗證過的模型。
+ALLOWED_MODEL = "claude-haiku-4-5"
 
 
 def get_required_env(name: str) -> str:

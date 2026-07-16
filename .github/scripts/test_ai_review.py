@@ -49,5 +49,5 @@ class TestGetRequiredEnv:
 
 
 class TestModelRestriction:
-    def test_allowed_model_is_claude_3_5_haiku(self):
-        assert ai_review.ALLOWED_MODEL.startswith("claude-3-5-haiku")
+    def test_allowed_model_is_claude_haiku_4_5(self):
+        assert ai_review.ALLOWED_MODEL.startswith("claude-haiku-4-5")
