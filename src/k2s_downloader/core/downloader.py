@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import io
 import json
 import math
@@ -45,6 +44,17 @@ CaptchaCallback = k2s_client.CaptchaCallback
 # Timeout (seconds) for the HEAD request used to discover total file size.
 # Previously unset, so a blocked/unresponsive IP would hang here forever.
 HEAD_REQUEST_TIMEOUT = 15
+
+# Connect/read timeout (seconds) passed to `requests.get` for each chunk
+# download. Previously a magic number inlined at the call site.
+CHUNK_REQUEST_TIMEOUT = 20
+# Separate from CHUNK_REQUEST_TIMEOUT: a stall watchdog checked between
+# `iter_content` reads. If no new data arrives within this many seconds the
+# attempt is abandoned (the size-mismatch/retry path below picks it up),
+# even though the underlying socket hasn't timed out yet. Coincidentally the
+# same value as CHUNK_REQUEST_TIMEOUT today, but they control different
+# things and are kept as separate constants.
+CHUNK_STALL_TIMEOUT = 20
 
 
 class DownloadCancelled(RuntimeError):
@@ -129,6 +139,7 @@ class Downloader:
         *,
         tmp_dir: Path | str = "tmp",
         url_cache_path: Path | str = "urls.json",
+        proxy_cache_path: Path | str = "proxies.txt",
         block_size: int = 32 * 1024,
         status_callback: StatusCallback = None,
         progress_callback: ProgressCallback = None,
@@ -137,6 +148,11 @@ class Downloader:
     ) -> None:
         self.tmp_dir = Path(tmp_dir)
         self.url_cache_path = Path(url_cache_path)
+        # Defaults to "proxies.txt" in the current working directory for
+        # backward compatibility with get_working_proxies()'s own default;
+        # pass an absolute path (e.g. a user data directory) to avoid
+        # writing into whatever directory the process happens to run from.
+        self.proxy_cache_path = Path(proxy_cache_path)
         self.block_size = block_size
         self.status_callback = status_callback
         self.progress_callback = progress_callback
@@ -220,6 +236,15 @@ class Downloader:
         lock. Returns ``None`` if ``stop_event`` is set while waiting.
         """
         while not self.stop_event.is_set():
+            # Prefer the direct connection (index 0, always None -- see
+            # proxy.get_working_proxies) over routing through a third-party
+            # proxy. The proxy list is sourced from a public, unauthenticated
+            # scraper and carried over plain HTTP even for an HTTPS target
+            # (see the ``prox`` dict below), so it can be MITM'd; only fall
+            # back to it when the direct slot is already busy or unusable.
+            if self.proxies and self.proxies[0] is None and self.proxy_locks[0].acquire(blocking=False):
+                return 0
+
             with self._working_proxy_lock:
                 known = list(self.working_proxy_indexes)
             for candidate in known:
@@ -234,7 +259,11 @@ class Downloader:
         return None
 
     def refresh_proxies(self, *, refresh: bool = False) -> None:
-        self.proxies = get_working_proxies(refresh=refresh, status_callback=self.status_callback)
+        self.proxies = get_working_proxies(
+            refresh=refresh,
+            status_callback=self.status_callback,
+            cache_path=self.proxy_cache_path,
+        )
         self.proxy_locks = [threading.Lock() for _ in self.proxies]
         with self._working_proxy_lock:
             self.working_proxy_indexes = []
@@ -439,6 +468,14 @@ class Downloader:
                 return
 
             proxy_value = self.proxies[proxy_idx]
+            # NOTE: the proxy connection itself is unauthenticated plain
+            # HTTP even though the target URL is HTTPS -- requests tunnels
+            # HTTPS through an HTTP CONNECT to this proxy, so the proxy
+            # operator sits in a position to observe/tamper with traffic.
+            # Combined with proxies.txt being sourced from a public,
+            # unauthenticated scraper (see proxy.py), do not rely on this
+            # path for sensitive downloads. _acquire_proxy_lock() already
+            # prefers the direct connection (index 0) over any proxy.
             prox = {"https": f"http://{proxy_value}"} if proxy_value else None
             added_to_active = True
             with self._proxy_state_lock:
@@ -446,13 +483,13 @@ class Downloader:
             self._notify_proxy_state()
 
             try:
-                with contextlib.suppress(Exception):
+                try:
                     response = requests.get(
                         urls[thread_index],
                         headers={"Range": f"bytes={chunk_range}", "User-Agent": headers["User-Agent"]},
                         stream=True,
                         proxies=prox,
-                        timeout=20,
+                        timeout=CHUNK_REQUEST_TIMEOUT,
                     )
 
                     if response.status_code not in (200, 206):
@@ -473,11 +510,23 @@ class Downloader:
                         if self.stop_event.is_set():
                             stop = True
                             break
-                        if chunk_start_time + 20 < time.time():
+                        if chunk_start_time + CHUNK_STALL_TIMEOUT < time.time():
                             break
                         chunk_start_time = time.time()
                         buffer.write(data)
                         report_progress(len(data))
+                except requests.exceptions.RequestException as exc:
+                    # Network-level failure (connection error, read timeout,
+                    # a chunked-encoding error mid-stream, etc.). Previously
+                    # a bare ``contextlib.suppress(Exception)`` swallowed
+                    # this entirely, so the only visible symptom was a
+                    # coincidental "size mismatch" below with no indication
+                    # of *why* the request actually failed.
+                    self._mark_chunk_failed(
+                        range_meta,
+                        f"request error via proxy {proxy_value or 'LOCAL'}: {exc}",
+                    )
+                    return
 
                 chunk_bytes = len(buffer.getvalue())
                 if not math.isclose(chunk_bytes, expected_bytes, abs_tol=1):
@@ -508,6 +557,15 @@ class Downloader:
                     progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
                 if self.progress_callback:
                     self.progress_callback(self._bytes_downloaded, self._total_bytes, done, self._ranges_total)
+            except Exception as exc:  # noqa: BLE001 - a chunk thread must never crash
+                # silently and leave range_meta["inUse"] stuck at True forever
+                # (the scheduling loop would then wait on this range forever).
+                # Anything unexpected past the request/streaming stage (e.g. a
+                # disk write failure) is recorded the same way a network
+                # failure is, instead of the old blanket suppress-and-ignore.
+                self._mark_chunk_failed(
+                    range_meta, f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}"
+                )
             finally:
                 if added_to_active:
                     with self._proxy_state_lock:
