@@ -131,25 +131,46 @@
 
 ## P4 — 程式碼品質與可維護性
 
-- [ ] **P4-1 `main_window.py` 重複賦值與註解語言混用**
+- [x] **P4-1 `main_window.py` 重複賦值與註解語言混用**（2026-07-17 完成）
   - 位置：`gui/main_window.py:48`–`49`（`_collapsed_height` 重複）、`:298`/`:300`（`sizeHint` 重複）、`:339`/`:352`（簡繁混雜註解）
-  - 建議：清理重複行、統一註解語言。
-- [ ] **P4-2 `_download_once` 過長且職責混雜**
-  - 位置：`downloader.py:296`
-  - 建議：拆出「排程 / 單段下載 / 合併」等函式；導入 `logging` 取代零散 print/callback。
-- [ ] **P4-3 `human_readable_bytes` 單位標示不一致**
-  - 位置：`downloader.py:100`（除以 1024 卻標 KB/MB）
-  - 建議：標示改 KiB/MiB，或改用 1000 進位。
+  - 修法：刪除兩處重複賦值；`_toggle_dev_panel` 內的中文註解改成英文，統一符合專案其他檔案（`downloader.py`／`k2s_client.py`／`proxy.py`）的英文註解慣例。
+  - 驗證：`ruff check` 全過、`py_compile` 語法確認（本機無 PySide6，無法完整 import 執行，但純語法／靜態層級已驗證無誤）。GUI 無測試覆蓋屬既有慣例（見 NFR-4 / `readme-en.md`）。
+
+- [x] **P4-2 `_download_once` 過長且職責混雜**（2026-07-17 完成）
+  - 位置：`downloader.py`（原 `_download_once`，約 280 行）
+  - 修法：拆成 5 個獨立 method —
+    `_fetch_total_size`（HEAD 請求＋Content-Length 解析）、
+    `_report_progress`（進度回報，`progress_bar` 改為明確參數而非 closure 捕捉）、
+    `_download_chunk`（原本的 `download_chunk` nested closure，改為正式 method，透過 `threading.Thread(target=self._download_chunk, kwargs={...})` 呼叫）、
+    `_run_scheduling_loop`（排程／派工迴圈，回傳 `failed_chunk`）、
+    `_merge_parts`（合併 part 檔案為最終檔案）。
+    `_download_once` 現在只負責串接這幾個 method，本身縮到約 40 行。
+  - **重要正確性分析**：原本 `download_chunk` 透過 `nonlocal stop` 在多個 thread 間共用一個 boolean 來鏡射「是否已取消」。逐一檢查每個設定 `stop=True` 的路徑後，證實這個 boolean 在所有情況下都只在 `self.stop_event.is_set()` 已經（或同一敘述中正在）成立時才會被設為 True，因此完全等價於直接檢查 `self.stop_event`，且是多餘、額外增加跨 thread 共享可變狀態風險的設計。重構後 `_download_chunk` 完全不再碰任何 stop 旗標；`_run_scheduling_loop` 保留一個純本地（不跨 thread 共享）的 `stop_scheduling` 變數，只用來額外涵蓋「chunk 永久失敗」這個與 `stop_event` 無關的排程迴圈跳出條件。最終判斷「是否該丟出 `DownloadCancelled`」的地方，從讀取 `stop` 變數改為直接讀取 `self.stop_event.is_set()`，行為完全等價。
+  - **「導入 logging 取代零散 print/callback」評估結論**：不採用。全專案 `print()` 呼叫只有 2 處（`cli.py` 的使用者可見結束訊息、`gui/app.py` 載入 stylesheet 失敗時的 fallback），且 `core/` 早已透過建構子 callback（`status_callback`／`progress_callback`／`proxy_state_callback`）把狀態回報跟顯示邏輯解耦 — 這正是讓同一套下載邏輯能同時驅動 CLI（`status_callback=print`）與 Qt GUI（callback 接到 Qt signal）而不需要知道對方是誰的設計。這已經是正確的抽象，改用 `logging` 反而會是不必要的架構變動，故不執行；已記錄在 `CONTRIBUTING.md` 的 code style 段落供後續參考。
+  - 測試：既有 74 個測試（含 P0~P2 的並發測試）重構後原封不動全數通過，且連續跑 5 次確認無 flaky；額外用 `py_compile`／`ruff`／CLI `--help` smoke test 驗證。未新增測試檔案 — 這是純重構（behavior-preserving refactor），既有測試已經是最適合的迴歸防護網（若新增針對 private method 拆分的測試，反而會鎖死實作細節、不利未來再次重構）。
+
+- [x] **P4-3 `human_readable_bytes` 單位標示不一致**（2026-07-17 完成）
+  - 位置：`downloader.py`（`human_readable_bytes`）
+  - 修法：單位標示從 `KB/MB/GB/TB` 改成 `KiB/MiB/GiB/TiB/PiB`，符合實際除以 1024 的二進位換算（並與 `gui/main_window.py` 的 `_format_speed` 既有用法一致）。
+  - 測試：`tests/test_human_readable_bytes.py`（各單位邊界值、確認輸出不再出現舊的十進位風格標籤）。
 
 ---
 
 ## P5 — 文件與開發體驗（DX）
 
-- [ ] **P5-1 建立 canonical 文件**（依全域規範 `requirements-en.md` 含 AC、`readme-en.md` 架構）
-  - 中英雙語同步：`*-en.md`（AI/canonical）＋ `*-zh.md`（human-facing）。
-- [~] **P5-2 補齊 tooling 設定**：~~`pyproject.toml` 加入 `[tool.ruff]` / `[tool.pytest.ini_options]`~~（已隨 P1-3 完成）；尚餘：新增 `CONTRIBUTING`。
-- [~] **P5-3 Readme 補充**：~~proxy 安全性警告~~（已隨 P2-3 完成，見「Security Note: Public Proxies」段落）；
-  尚餘：captcha 實際行為說明、法律與使用聲明。（`.[dev]` 安裝與測試說明已隨 P1-3/P1-4 完成。）
+- [x] **P5-1 建立 canonical 文件**（2026-07-17 完成）
+  - 新增 [`requirements-en.md`](requirements-en.md)（10 個 REQ、每個附 AC，涵蓋 URL 驗證、檔名/大小查詢、切段下載、
+    重試/backoff、captcha、proxy pool、取消、媒體檢查、CLI、GUI）與 [`readme-en.md`](readme-en.md)（模組地圖、
+    控制流程、threading/並發模型含關鍵設計決策說明、proxy 設計、錯誤分類、timeout 一覽表、GUI 整合、測試結構、CI）。
+    所有內容逐項對照現有程式碼核實，非憑空撰寫。
+  - 對應繁中人類可讀版本 [`requirements-zh.md`](requirements-zh.md)、[`readme-zh.md`](readme-zh.md) 已同步建立，
+    技術術語保留英文，符合全域文件規範（`*-en.md` = AI/canonical，`*-zh.md` = human-facing）。
+- [x] **P5-2 補齊 tooling 設定**（2026-07-17 完成）：~~`pyproject.toml` 加入 `[tool.ruff]` / `[tool.pytest.ini_options]`~~（已隨 P1-3 完成）；
+  新增 [`CONTRIBUTING.md`](CONTRIBUTING.md)（環境設定、測試/lint 指令、程式風格慣例、commit message 格式、PR 慣例），
+  `Readme.md` 的 Development 段落已加上連結。
+- [x] **P5-3 Readme 補充**（2026-07-17 完成）：~~proxy 安全性警告~~（已隨 P2-3 完成）；
+  新增「Captcha Handling」段落說明 CLI/GUI 的實際互動流程與答錯上限行為、「Legal Notice」段落說明本工具與 Keep2Share
+  無關聯、使用者須自行負責遵守其 Terms of Service 與著作權法規。（`.[dev]` 安裝與測試說明已隨 P1-3/P1-4 完成。）
 
 ---
 
@@ -159,9 +180,13 @@
 2. ~~再處理併發相關 **P0-3、P0-4** 與掛死相關 **P0-5、P0-6**。~~ ✅ 已完成 — **P0 全部 6 項皆已修復**
 3. ~~接著 **P1**（依賴／CI／文件入口）讓專案可持續驗證。~~ ✅ 已完成（P1-1 ~ P1-4 全數完成）
 4. ~~之後 **P2**（錯誤處理與健壯性）。~~ ✅ 已完成 — **P2 全部 4 項（P2-1 ~ P2-4）皆已修復，含 P3-4**
-5. 接著 **P4 → P5** 逐步推進。← 下一步建議從 **P4**（程式碼品質與可維護性）開始
+5. ~~接著 **P4 → P5** 逐步推進。~~ ✅ 已完成 — **P4 全部 3 項（P4-1 ~ P4-3）、P5 全部 3 項（P5-1 ~ P5-3）皆已完成**
 
 > 註：P0（P0-1 ~ P0-6）、P1（P1-1 ~ P1-4）已於 2026-07-16 完成並合併進 `main`（PR #3，merge commit `8581b77`）。
-> P2（P2-1 ~ P2-4，含補齊的 P3-4）已於 2026-07-17 完成，分支 `feature/p2-error-handling-robustness`。
+> P2（P2-1 ~ P2-4，含補齊的 P3-4）已於 2026-07-17 完成並合併（PR #6，merge commit `71eb5f5`）。
+> P4（P4-1 ~ P4-3）、P5（P5-1 ~ P5-3）已於 2026-07-17 完成，分支 `feature/p4-p5-quality-and-docs`。
 > 所有測試（本機 `.venv`，`pytest -q`，`pyproject.toml` 已設 `pythonpath=["src"]` 免手動設環境變數）
-> 共 65 個全數通過，`ruff check .` 全過。接手 session 請從 **P4** 開始逐項認領。
+> 共 74 個全數通過（連續跑 5 次確認無 flaky），`ruff check .` 全過。
+>
+> **todolist 的 P0 ~ P5 六個優先級目前皆已全數完成。** 若要繼續優化本專案，建議之後從頭重新檢視現況
+> （程式碼可能已有新變動）並開一輪新的優先序評估，而非假設此份 todolist 仍完整反映現狀。

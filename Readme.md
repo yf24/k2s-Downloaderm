@@ -39,6 +39,16 @@ uv run -- python -m k2s_downloader.gui.app
 ```
 Provide the K2S link inside the application, optionally override the output filename, adjust the thread count and split size, then start the download. Captcha prompts appear inline.
 
+## Captcha Handling
+Keep2Share requires solving an image captcha to authorize each download session. Behavior differs slightly by interface:
+- **GUI**: the captcha image appears inline in the app; type your answer into the field below it and submit. The download proceeds automatically once accepted.
+- **CLI**: the captcha image opens in your system's default image viewer and the program waits for your answer on stdin (or supply your own `captcha_callback` if you're using `k2s_downloader` as a library, e.g. to automate solving).
+
+If an answer is rejected, you'll be prompted again with a fresh challenge; after 3 rejected attempts the download aborts with an error suggesting your IP may be blocked or rate-limited rather than continuing to prompt indefinitely.
+
+## Legal Notice
+This is an unofficial, third-party tool and is not affiliated with, endorsed by, or supported by Keep2Share. It automates the same download flow available through Keep2Share's own website. You are responsible for complying with [Keep2Share's Terms of Service](https://k2s.cc/) and all applicable copyright and data-protection law for anything you download with it; the maintainers accept no liability for how it's used. See [LICENSE](LICENSE) for the software license itself (MIT — provided as-is, without warranty).
+
 ## Alternative Entry Points
 Without the console scripts, the same entry points are reachable as plain modules/scripts:
 ```
@@ -52,4 +62,4 @@ uv sync --extra dev        # or: pip install -e ".[dev]"
 uv run pytest -q           # run the test suite
 uv run ruff check .        # lint
 ```
-Both checks also run automatically in CI (`.github/workflows/ci.yml`) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller.
+Both checks also run automatically in CI (`.github/workflows/ci.yml`) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing conventions, and the commit-message format used in this repo.
