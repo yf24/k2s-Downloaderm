@@ -4,7 +4,8 @@
 
 ## 現況（2026-07-17）
 
-- todolist（`docs/ai/todolist.md`）第一輪 P0~P5 全數完成；2026-07-17 完成第二輪靜態 code review，新增 R2-1 ~ R2-13 backlog（並發 race、Windows 相容性、exe 打包整備、proxy 來源改善、加速機制量測驗證、大檔 99% 尾端速度崩落對策、斷點續傳與暫存可見性），全部未認領，詳見該檔「第二輪（R2）」段落。其中 R2-7＋R2-13（串流寫入＋續傳）是使用者明確提出的需求，優先度高。
+- todolist（`docs/ai/todolist.md`）第一輪 P0~P5 全數完成；2026-07-17 完成第二輪靜態 code review，新增 R2-1 ~ R2-13 backlog（並發 race、Windows 相容性、exe 打包整備、proxy 來源改善、加速機制量測驗證、大檔 99% 尾端速度崩落對策、斷點續傳與暫存可見性），詳見該檔「第二輪（R2）」段落。其中 R2-7＋R2-13（串流寫入＋續傳）是使用者明確提出的需求，優先度高。
+- **R2-P0（R2-1 ~ R2-3 三個並發 race）已於 2026-07-17 修正**，分支 `fix/r2-p0-concurrency-races`，含 regression 測試 `tests/test_downloader_concurrency_races.py`（修正前 4 個測試全 fail、修正後全 pass，連跑 10 輪穩定；`pytest -q` 78 passed、`ruff check .` 乾淨）。PR 待人類 review/merge。其餘 R2-4 ~ R2-13 仍未認領。
 - **[#10](https://github.com/yf24/k2s-Downloaderm/pull/10)`docs/reorganize-ai-human-audience` → `main` 已 merge**（merge commit `2226450`）。把散落在根目錄的文件依受眾（AI／人類）重新分類，新增根目錄 `AGENTS.md` 作為 AI agent 進入點。
 - 本檔（`docs/ai/HANDOFF.md`）本身也是同一個 PR #10 的一部分（同分支上的追加 commit）。
 

@@ -189,19 +189,19 @@
 
 ## R2-P0 — 並發正確性（靜態分析發現的 race，尚未實測重現）
 
-- [ ] **R2-1 chunk 完成路徑的 `inUse`/`downloaded` 寫入順序 race → 進度重複計數、可能提前 merge**
+- [x] **R2-1 chunk 完成路徑的 `inUse`/`downloaded` 寫入順序 race → 進度重複計數、可能提前 merge**（2026-07-17 完成；測試：`tests/test_downloader_concurrency_races.py::TestCompletionPublishOrder`。實作：成功路徑改為在 `_progress_lock` 內先設 `downloaded` 再清 `inUse` 並一併遞增 `_done_count`；排程端重用分支的「檢查＋標記＋計數」同樣移入 `_progress_lock` 原子完成，且 size 相符時一律 `continue` 不再重派。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_download_chunk` 成功路徑 `range_meta["inUse"] = False` 先於 `range_meta["downloaded"] = True`；`_run_scheduling_loop` 的「part 檔已存在」重用分支）
   - 問題：排程執行緒若在這兩行之間讀到 `inUse=False, downloaded=False`，且 part 檔已寫完（`write_bytes` 在更早），會走進重用分支再次 `_report_progress(bytes)` 並 `_done_count += 1` —— 與 chunk 執行緒自己的計數重複。後果：進度條超過 100%、`_done_count` 超前使 `while self._done_count < len(ranges)` 提前跳出，若此時仍有其他 range 未完成，`_merge_parts` 會因缺 part 檔丟出未分類的 `FileNotFoundError`（違反錯誤分類慣例）。
   - 建議做法：把成功路徑改為先設 `downloaded = True` 再設 `inUse = False`（排程端讀取順序是先 `inUse` 後 `downloaded`，交換寫入順序即可關閉這個窗口）；並補一個以 `_progress_lock` 保護「檢查＋標記」的防護。
   - 測試：模擬排程執行緒與 chunk 執行緒交錯（可將兩行寫入之間注入 hook），驗證 `_done_count` 不重複遞增。
 
-- [ ] **R2-2 size-mismatch 路徑提前釋放 `url_locks` → 可能釋放到別的 chunk 正持有的 lock**
+- [x] **R2-2 size-mismatch 路徑提前釋放 `url_locks` → 可能釋放到別的 chunk 正持有的 lock**（2026-07-17 完成；測試：`tests/test_downloader_concurrency_races.py::TestUrlLockSingleRelease`。實作：刪除 size-mismatch 分支的提前釋放，統一由 `finally` 單點釋放。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_download_chunk` 內 size-mismatch 分支的 `self.url_locks[thread_index].release()`，與 `finally` 內的釋放重複）
   - 問題：size mismatch 時先釋放一次 url lock，之後 `finally` 又用 `.locked()` 檢查再釋放一次。`threading.Lock` 沒有擁有者概念 —— 若在兩次釋放之間排程器已把同一 `thread_index` 派給新 chunk（重新 acquire），`finally` 的第二次釋放會把**新 chunk 正持有的 lock** 放掉，排程器便可能對同一條 download URL 同時派兩個 chunk（同一 token 兩條並行連線，可能觸發 host 端拒絕/限速，且違反 url lock 的設計不變量）。
   - 建議做法：刪除 size-mismatch 分支的提前釋放，統一只由 `finally` 釋放（該分支 `return` 後必然進 `finally`，提前釋放毫無必要）。
   - 測試：併發測試驗證同一 `thread_index` 不會被兩個活躍 chunk 同時使用。
 
-- [ ] **R2-3 失敗/取消後不 join in-flight chunk threads → 殘留執行緒與重試下載互相干擾**
+- [x] **R2-3 失敗/取消後不 join in-flight chunk threads → 殘留執行緒與重試下載互相干擾**（2026-07-17 完成；測試：`tests/test_downloader_concurrency_races.py::TestSchedulingLoopJoinsChunkThreads`。實作：`_run_scheduling_loop` 追蹤 chunk `Thread` handles，`finally` 內先 join（共用 deadline `CHUNK_THREADS_JOIN_TIMEOUT=30s`）再釋放 lock；永久失敗時額外 `stop_event.set()` 讓 in-flight threads 提早退出——`_download_once` 會先丟 `ChunkDownloadFailed` 才檢查 `stop_event`，不會誤判成取消。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_run_scheduling_loop` 以 daemon thread 派工、結束時不等待；`finally` 還會直接釋放所有 url/proxy locks，包括仍被 in-flight chunk 持有的）
   - 問題：`ChunkDownloadFailed` 或取消後，仍在串流中的 chunk threads 不會被等待就返回。CLI 情境下 process 退出會硬殺 daemon threads（part 檔可能寫一半）；GUI 情境更糟 —— 使用者對同一檔案立刻重試時，舊執行緒可能仍在對同一批 `tmp/<filename>.partNN` 路徑寫入，與新一輪下載互踩導致損毀。
   - 建議做法：`_run_scheduling_loop` 追蹤派出的 `Thread` handles，退出前逐一 `join(timeout=...)`（chunk 執行緒本身已會因 `stop_event` 提早結束，join 是收尾保證）；lock 釋放移到 join 之後。

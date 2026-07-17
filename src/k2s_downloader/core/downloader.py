@@ -56,6 +56,12 @@ CHUNK_REQUEST_TIMEOUT = 20
 # same value as CHUNK_REQUEST_TIMEOUT today, but they control different
 # things and are kept as separate constants.
 CHUNK_STALL_TIMEOUT = 20
+# Overall deadline (seconds) for joining in-flight chunk threads when the
+# scheduling loop exits. Slightly above CHUNK_REQUEST_TIMEOUT because a
+# thread blocked inside `requests.get` only notices `stop_event` once the
+# socket-level connect/read timeout fires; threads in the streaming loop or
+# in `_acquire_proxy_lock` exit within a block read / 0.02s.
+CHUNK_THREADS_JOIN_TIMEOUT = 30.0
 
 
 @dataclass(frozen=True)
@@ -549,8 +555,12 @@ class Downloader:
                 self._mark_chunk_failed(
                     range_meta, f"size mismatch: got {chunk_bytes} expected {expected_bytes}"
                 )
-                if self.url_locks[thread_index].locked():
-                    self.url_locks[thread_index].release()
+                # Do NOT release url_locks[thread_index] here: the ``finally``
+                # below is the single release point. Releasing early meant the
+                # scheduler could hand this slot to a new chunk, and the
+                # (unowned) second release in ``finally`` would then free the
+                # lock out from under that new holder, allowing two chunks to
+                # share one download URL concurrently.
                 return
 
             range_meta.pop("last_error", None)
@@ -562,10 +572,16 @@ class Downloader:
             if is_newly_known:
                 self._notify_proxy_state()
 
-            range_meta["inUse"] = False
-            range_meta["downloaded"] = True
-
+            # Publish completion atomically, and with ``downloaded`` set
+            # before ``inUse`` is cleared. The scheduling loop reads
+            # ``inUse`` then ``downloaded``; clearing ``inUse`` first opened
+            # a window where the part-file-reuse branch saw a finished part
+            # with both flags False and counted this range a second time
+            # (progress > 100%, premature exit from the scheduling loop, and
+            # an uncategorized FileNotFoundError from _merge_parts).
             with self._progress_lock:
+                range_meta["downloaded"] = True
+                range_meta["inUse"] = False
                 self._done_count += 1
                 done = self._done_count
             if not ctx.progress_bar.disable:
@@ -608,11 +624,13 @@ class Downloader:
         """
         failed_chunk: Optional[FailedChunk] = None
         stop_scheduling = False
+        chunk_threads: List[threading.Thread] = []
 
         try:
             while self._done_count < len(ranges):
                 if stop_scheduling:
                     break
+                chunk_threads = [t for t in chunk_threads if t.is_alive()]
                 now = time.time()
                 for idx, meta in ranges.items():
                     if self.stop_event.is_set():
@@ -642,15 +660,23 @@ class Downloader:
                     if part_path.exists():
                         existing = part_path.read_bytes()
                         if math.isclose(len(existing), meta["bytes"], abs_tol=1):
-                            if not meta["downloaded"]:
-                                self._report_progress(int(meta["bytes"]), ctx)
-                                meta["downloaded"] = True
-                                with self._progress_lock:
+                            # Claim the range under _progress_lock so this
+                            # check-and-mark cannot interleave with the chunk
+                            # thread's own completion publish (which holds the
+                            # same lock) and double-count the range.
+                            with self._progress_lock:
+                                claimed = not meta["downloaded"]
+                                if claimed:
+                                    meta["downloaded"] = True
                                     self._done_count += 1
                                     done = self._done_count
+                            if claimed:
+                                self._report_progress(int(meta["bytes"]), ctx)
                                 if not ctx.progress_bar.disable:
                                     ctx.progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
-                                continue
+                            # Either way the part is complete on disk; never
+                            # fall through and dispatch it again.
+                            continue
                         else:
                             part_path.unlink()
 
@@ -659,16 +685,40 @@ class Downloader:
                             continue
                         self.url_locks[thread_index].acquire()
                         meta["inUse"] = True
-                        threading.Thread(
+                        chunk_thread = threading.Thread(
                             target=self._download_chunk,
                             args=(idx, meta, thread_index, ctx),
                             daemon=True,
-                        ).start()
+                        )
+                        chunk_threads.append(chunk_thread)
+                        chunk_thread.start()
                         break
                 time.sleep(0.05)
         except KeyboardInterrupt:
             self.cancel()
         finally:
+            if failed_chunk is not None:
+                # A permanently-failed range aborts the whole download, so
+                # signal the in-flight chunk threads too; otherwise the join
+                # below would wait out full chunk transfers. download()
+                # clears stop_event at the start of every run, and
+                # _download_once raises ChunkDownloadFailed before it ever
+                # consults stop_event, so this cannot be mistaken for a
+                # user cancellation.
+                self.stop_event.set()
+            # Wait for in-flight chunk threads before touching their locks.
+            # Releasing url/proxy locks while a thread still held them let
+            # the next download round (e.g. an immediate GUI retry) write to
+            # the same tmp part files concurrently and corrupt them.
+            join_deadline = time.time() + CHUNK_THREADS_JOIN_TIMEOUT
+            for chunk_thread in chunk_threads:
+                chunk_thread.join(timeout=max(0.0, join_deadline - time.time()))
+            leftover = sum(1 for t in chunk_threads if t.is_alive())
+            if leftover:
+                self.log(
+                    f"{leftover} chunk thread(s) still running after "
+                    f"{CHUNK_THREADS_JOIN_TIMEOUT:.0f}s; releasing their locks anyway."
+                )
             for lock in self.url_locks:
                 if lock.locked():
                     lock.release()
