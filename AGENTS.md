@@ -55,13 +55,19 @@ tests/                    # 對應 core/ 各模組；所有 requests 呼叫皆 m
 
 ## 5. Tracking：`docs/ai/todolist.md`
 
-這是本專案的 living backlog，依優先序排列（P0 最嚴重／會損毀資料或掛死 → P5 文件與 DX）。目前 P0～P5 皆已完成（狀態見檔案內 `[x]`）。若要接手新項目：
+這是本專案的 living backlog，依優先序排列（P0 最嚴重／會損毀資料或掛死 → P5 文件與 DX；第二輪起改用 `R2-N` 編號）。若要接手新項目：
 
 - 更新對應項目的 checkbox、完成日期、測試位置。
 - 保留原本的「問題／位置／建議做法」文字，讓後續讀者仍看得懂脈絡。
 - PR 盡量只涵蓋單一優先序的工作量，不要把不相關的修正綁在一起。
 
-若 `docs/ai/todolist.md` 的優先級都已完成，代表需要重新從頭檢視現況（程式碼可能已有新變動）再開新一輪優先序評估，不要假設清單仍完整反映現狀。
+若 `docs/ai/todolist.md` 目前這一輪的優先級都已完成，代表需要重新從頭檢視現況（程式碼可能已有新變動）再開新一輪優先序評估，不要假設清單仍完整反映現狀。
+
+**歸檔規則**：某一整輪（例如第一輪 P0~P5）全部項目皆 `[x]` 完成後，該輪完整內容會搬移到
+`docs/ai/todolist-archive/`（例如 [`round-1-p0-p5.md`](docs/ai/todolist-archive/round-1-p0-p5.md)），
+`docs/ai/todolist.md` 只留一段摘要＋連結，避免檔案無限累積拖慢每次開工的讀取。**若需要查閱已完成輪次
+的歷史脈絡**（例如某個既有設計決策當初為何這樣做），才去讀 `docs/ai/todolist-archive/` 裡對應的檔案；
+日常開工不需要主動讀它。
 
 ## 6. PR / Review 相關約束（Coder Agent 專用規則，原 `.claudeprompt` 內容）
 
