@@ -34,7 +34,14 @@ def get_required_env(name: str) -> str:
 
 
 def build_review_prompt(diff_text: str) -> str:
-    """組合要送給 Claude 的 code review prompt。"""
+    """組合要送給 Claude 的 code review prompt。
+
+    留言篇幅設計上明確要求精簡、聚焦在問題本身（見下方 prompt 內文），
+    而非對已經寫得好的部分展開讚美 —— 過去的版本會先寫一段「整體評價」
+    肯定寫得好的地方，等真正進入 Critical/Improvement 清單時，篇幅已經
+    所剩無幾，導致留言在 GitHub 留言長度上限前被截斷、後面的建議完全
+    看不到（PR #13 即是一例，回應時第 5 項建議中途被截斷）。
+    """
     return f"""
 你是一位資深的 Python 技術主管。請針對以下 Pull Request 的代碼變動（Git Diff）進行嚴格的 Code Review。
 請特別注意：
@@ -47,7 +54,11 @@ def build_review_prompt(diff_text: str) -> str:
 * 如果只有 `Nitpick` 等級的問題，請直接給予 Approve，不要要求 Coder 重新修改。
 * 只有在偵測到 `Critical` 或嚴重的 `Improvement` 時，才要求重新修改。
 
-如果是優秀的修改，請給予肯定。如果有需要改進的地方，請具體指出並給出修改建議程式碼。
+留言篇幅有限，請把篇幅都留給實際的問題與建議，不要花篇幅寫「整體評價」或讚美已經寫得好的部分：
+* 不需要摘要或肯定程式碼寫得好的地方；如果整體品質不錯，最多一句話帶過即可（例如「其餘部分未發現重大問題」），不要展開描述好在哪裡。
+* 只詳細說明有疑慮、需要修改的地方；每項請包含檔案位置與問題說明，修改建議以精簡的程式碼片段示意即可，不需要整段重寫。
+* 若完全沒有 `Critical` 或 `Improvement` 等級的問題，直接回覆「本次變更無重大問題，Approve」，不需要其他內容。
+
 以下是程式碼變動：
 {diff_text}
 """
@@ -89,7 +100,7 @@ def main() -> None:
         model=ALLOWED_MODEL,
         max_tokens=2000,
         temperature=0.2,
-        system="你是一位嚴格、專業但語氣友善的 Code Review 機器人。請用繁體中文回覆。",
+        system="你是一位嚴格、專業但語氣友善的 Code Review 機器人。請用繁體中文回覆，回覆力求精簡，把篇幅留給實際的問題與建議。",
         messages=[{"role": "user", "content": prompt}],
     )
     review_comment = response.content[0].text

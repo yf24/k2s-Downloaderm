@@ -48,7 +48,7 @@ This repo follows [Conventional Commits](https://www.conventionalcommits.org/) s
 
 ## Tracking ongoing work
 
-`docs/ai/todolist.md` is the living backlog for this project, organized by priority (P0 highest). If you're picking up an item from it: update its checkbox, completion date, and test location when you're done, and keep the original problem/location/suggestion text so the entry stays useful to whoever reads it next.
+`docs/ai/todolist.md` is the living backlog for this project, organized by priority (P0 highest; later rounds use `R2-N` numbering). If you're picking up an item from it: update its checkbox, completion date, and test location when you're done, and keep the original problem/location/suggestion text so the entry stays useful to whoever reads it next. Once an entire round is fully checked off, its full content moves to `docs/ai/todolist-archive/` and `todolist.md` keeps only a short summary + link — check that directory if you need the historical context behind an already-completed round, but there's no need to read it for day-to-day work.
 
 ## Pull requests
 

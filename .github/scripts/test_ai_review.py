@@ -55,3 +55,32 @@ class TestModelRestriction:
 
     def test_allowed_model_is_claude_haiku_4_5(self):
         assert ai_review.ALLOWED_MODEL in self.ALLOWED_MODELS
+
+
+class TestReviewPromptDoesNotAskForPraise:
+    """R2-14: the prompt used to explicitly ask the model to praise good
+    changes ("如果是優秀的修改，請給予肯定"), which produced a lengthy
+    "整體評價" preamble before the actual Critical/Improvement findings.
+    Combined with a fixed max_tokens budget, this pushed later findings
+    past the truncation point (observed on PR #13). The prompt must
+    instead tell the model to skip praise and keep findings concise.
+    """
+
+    def test_prompt_does_not_instruct_the_model_to_praise_good_code(self):
+        prompt = ai_review.build_review_prompt("--- diff ---")
+        assert "請給予肯定" not in prompt
+
+    def test_prompt_instructs_skipping_the_overall_assessment_preamble(self):
+        prompt = ai_review.build_review_prompt("--- diff ---")
+        assert "整體評價" in prompt  # only mentioned to say "don't write one"
+        assert "不要花篇幅寫" in prompt or "不需要摘要或肯定" in prompt
+
+    def test_prompt_still_contains_the_diff_text(self):
+        prompt = ai_review.build_review_prompt("MARKER-DIFF-CONTENT")
+        assert "MARKER-DIFF-CONTENT" in prompt
+
+    def test_prompt_still_defines_the_severity_categories(self):
+        prompt = ai_review.build_review_prompt("--- diff ---")
+        assert "[Critical/Bug]" in prompt
+        assert "[Improvement]" in prompt
+        assert "[Nitpick]" in prompt
