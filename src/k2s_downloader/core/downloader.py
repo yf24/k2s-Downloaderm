@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 import requests
 from shutil import which
@@ -579,7 +579,11 @@ class Downloader:
                 self._notify_proxy_state()
             if self.url_locks[thread_index].locked():
                 self.url_locks[thread_index].release()
-            if self.proxy_locks[proxy_idx].locked():
+            # proxy_idx is always an int by this point (the function returns
+            # above before the try block if _acquire_proxy_lock() gave back
+            # None), but its static type is Optional[int]; guard explicitly
+            # so this stays correct even if that early return is ever moved.
+            if proxy_idx is not None and self.proxy_locks[proxy_idx].locked():
                 self.proxy_locks[proxy_idx].release()
 
     def _run_scheduling_loop(
@@ -608,10 +612,15 @@ class Downloader:
                         stop_scheduling = True
                         break
                     if meta.get("failed"):
+                        # meta["attempts"] is always set to an int by
+                        # _mark_chunk_failed before "failed" is ever set, but
+                        # the dict's static value type is `object`; cast
+                        # narrows that explicitly instead of a blanket
+                        # `type: ignore` on the whole expression.
                         failed_chunk = (
                             idx,
                             str(meta.get("last_error", "unknown error")),
-                            int(meta.get("attempts", 0)),  # type: ignore[arg-type]
+                            cast(int, meta.get("attempts", 0)),
                         )
                         stop_scheduling = True
                         break
