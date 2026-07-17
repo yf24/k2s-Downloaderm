@@ -4,7 +4,7 @@
 
 ## 現況（2026-07-17）
 
-- `main` 分支目前與之前一樣，todolist（`docs/ai/todolist.md`）P0~P5 全數完成的狀態。
+- todolist（`docs/ai/todolist.md`）第一輪 P0~P5 全數完成；2026-07-17 完成第二輪靜態 code review，新增 R2-1 ~ R2-12 backlog（並發 race、Windows 相容性、exe 打包整備、proxy 來源改善、加速機制量測驗證、大檔 99% 尾端速度崩落對策），全部未認領，詳見該檔「第二輪（R2）」段落。
 - **[#10](https://github.com/yf24/k2s-Downloaderm/pull/10)`docs/reorganize-ai-human-audience` → `main` 已 merge**（merge commit `2226450`）。把散落在根目錄的文件依受眾（AI／人類）重新分類，新增根目錄 `AGENTS.md` 作為 AI agent 進入點。
 - 本檔（`docs/ai/HANDOFF.md`）本身也是同一個 PR #10 的一部分（同分支上的追加 commit）。
 

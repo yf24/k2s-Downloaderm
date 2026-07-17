@@ -180,6 +180,117 @@
 
 ---
 
+# 第二輪（R2）— 2026-07-17 靜態檢視後的新 backlog
+
+> 背景：第一輪 P0~P5 全數完成後，依「重新從頭檢視現況」原則做了一次完整靜態 code review
+> （本輪環境無法對 Keep2Share 做實際功能測試，所有發現皆來自程式碼閱讀，尚未實測重現）。
+> 動機含四個檢視面向：(1) 殘留嚴重問題、(2) Windows exe 打包可行性、(3) proxy 來源替代方案、
+> (4) 對照「突破瀏覽器 50KB/s 免費下載限制」這個根本目的的達成度。
+
+## R2-P0 — 並發正確性（靜態分析發現的 race，尚未實測重現）
+
+- [ ] **R2-1 chunk 完成路徑的 `inUse`/`downloaded` 寫入順序 race → 進度重複計數、可能提前 merge**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_download_chunk` 成功路徑 `range_meta["inUse"] = False` 先於 `range_meta["downloaded"] = True`；`_run_scheduling_loop` 的「part 檔已存在」重用分支）
+  - 問題：排程執行緒若在這兩行之間讀到 `inUse=False, downloaded=False`，且 part 檔已寫完（`write_bytes` 在更早），會走進重用分支再次 `_report_progress(bytes)` 並 `_done_count += 1` —— 與 chunk 執行緒自己的計數重複。後果：進度條超過 100%、`_done_count` 超前使 `while self._done_count < len(ranges)` 提前跳出，若此時仍有其他 range 未完成，`_merge_parts` 會因缺 part 檔丟出未分類的 `FileNotFoundError`（違反錯誤分類慣例）。
+  - 建議做法：把成功路徑改為先設 `downloaded = True` 再設 `inUse = False`（排程端讀取順序是先 `inUse` 後 `downloaded`，交換寫入順序即可關閉這個窗口）；並補一個以 `_progress_lock` 保護「檢查＋標記」的防護。
+  - 測試：模擬排程執行緒與 chunk 執行緒交錯（可將兩行寫入之間注入 hook），驗證 `_done_count` 不重複遞增。
+
+- [ ] **R2-2 size-mismatch 路徑提前釋放 `url_locks` → 可能釋放到別的 chunk 正持有的 lock**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_download_chunk` 內 size-mismatch 分支的 `self.url_locks[thread_index].release()`，與 `finally` 內的釋放重複）
+  - 問題：size mismatch 時先釋放一次 url lock，之後 `finally` 又用 `.locked()` 檢查再釋放一次。`threading.Lock` 沒有擁有者概念 —— 若在兩次釋放之間排程器已把同一 `thread_index` 派給新 chunk（重新 acquire），`finally` 的第二次釋放會把**新 chunk 正持有的 lock** 放掉，排程器便可能對同一條 download URL 同時派兩個 chunk（同一 token 兩條並行連線，可能觸發 host 端拒絕/限速，且違反 url lock 的設計不變量）。
+  - 建議做法：刪除 size-mismatch 分支的提前釋放，統一只由 `finally` 釋放（該分支 `return` 後必然進 `finally`，提前釋放毫無必要）。
+  - 測試：併發測試驗證同一 `thread_index` 不會被兩個活躍 chunk 同時使用。
+
+- [ ] **R2-3 失敗/取消後不 join in-flight chunk threads → 殘留執行緒與重試下載互相干擾**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_run_scheduling_loop` 以 daemon thread 派工、結束時不等待；`finally` 還會直接釋放所有 url/proxy locks，包括仍被 in-flight chunk 持有的）
+  - 問題：`ChunkDownloadFailed` 或取消後，仍在串流中的 chunk threads 不會被等待就返回。CLI 情境下 process 退出會硬殺 daemon threads（part 檔可能寫一半）；GUI 情境更糟 —— 使用者對同一檔案立刻重試時，舊執行緒可能仍在對同一批 `tmp/<filename>.partNN` 路徑寫入，與新一輪下載互踩導致損毀。
+  - 建議做法：`_run_scheduling_loop` 追蹤派出的 `Thread` handles，退出前逐一 `join(timeout=...)`（chunk 執行緒本身已會因 `stop_event` 提早結束，join 是收尾保證）；lock 釋放移到 join 之後。
+  - 測試：取消後斷言所有 chunk threads 已結束、無執行緒殘留寫檔。
+
+## R2-P1 — 實際使用必踩的輸入/平台相容性（對 Windows 目標尤其重要）
+
+- [ ] **R2-4 伺服器回傳的檔名未 sanitize → Windows 非法字元使所有 chunk 落地失敗**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_resolve_filename` / part 檔命名 / `_merge_parts`），檔名來源 `k2s_client.get_name`
+  - 問題：Keep2Share 回傳的原始檔名可能含 Windows 不允許的字元（`\ / : * ? " < > |`）或保留字（`CON`、`NUL`…）。目前直接拿來組 part 檔與最終檔路徑，在 Windows 上 `write_bytes` 會直接 `OSError` → 被 `_mark_chunk_failed` 當成一般錯誤重試 8 次後丟 `ChunkDownloadFailed`，錯誤訊息還誤導成「IP/proxy 被封鎖」。本專案目標平台就是 Windows（見 AGENTS.md §7），這是高機率實際踩到的問題。
+  - 建議做法：新增檔名 sanitize（替換非法字元、處理保留字與結尾空白/句點），在 `_resolve_filename` 統一套用；失敗時錯誤訊息應能區分「本地寫檔失敗」與「網路失敗」。
+  - 測試：對含各非法字元/保留字的檔名驗證 sanitize 結果；驗證磁碟寫入失敗不會被誤報成封鎖。
+
+- [ ] **R2-5 `filename` 含目錄成分時 part 檔路徑父目錄不存在 → 全數失敗**
+  - 位置：`src/k2s_downloader/core/downloader.py`（part 檔路徑 `self.tmp_dir / f"{ctx.filename}.partNN"`）
+  - 問題：CLI `--filename out/video.mp4` 這類含路徑的值會使 part 檔路徑變成 `tmp/out/video.mp4.partNN`，`tmp_dir.mkdir` 只建立 `tmp/`，寫入時 `FileNotFoundError` → 同 R2-4 的誤導性重試循環。
+  - 建議做法：part 檔一律只用 `Path(filename).name` 命名；最終輸出前確認/建立目標父目錄。
+  - 測試：`filename` 含相對路徑時 part 檔落在 `tmp/` 平面、最終檔寫到指定路徑。
+
+- [ ] **R2-6 `_fetch_total_size` 不檢查 HTTP status → 錯誤頁的 Content-Length 被當成檔案大小**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_fetch_total_size`）
+  - 問題：HEAD 回 403/429/5xx 時仍讀 `Content-Length`（錯誤頁大小），切出完全錯誤的 ranges，之後每個 chunk 都 size mismatch，浪費整輪重試才失敗，且訊息不指向真正原因（URL 過期/被封鎖）。
+  - 建議做法：非 2xx 直接丟 `RuntimeError`（訊息含 status code 與「download URL 可能已過期或被封鎖」提示）。
+  - 測試：mock HEAD 回 403 驗證立即失敗且訊息正確。
+
+## R2-P2 — 資源使用與死碼
+
+- [ ] **R2-7 每個 chunk 整段緩衝在記憶體 → 峰值可達數百 MiB**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_download_chunk` 的 `io.BytesIO`；`_merge_parts` 的一次性 `chunk.read()`）
+  - 問題：預設 20 threads × ≥20MiB split ≈ 400MiB 峰值；媒體檢查失敗重試會把 split 加倍再翻倍。對打包成 exe 給一般 Windows 使用者的情境不友善。
+  - 建議做法：chunk 改為邊下邊寫暫存檔（`.partNN.tmp` 完成後 rename 成 `.partNN`，rename 的原子性同時消除「寫一半的 part 被重用分支誤判完整」的風險）；`_merge_parts` 改 `shutil.copyfileobj` 串流合併。
+  - 測試：驗證 rename 前的 `.tmp` 不會被排程重用分支撿走；合併結果 byte-identical。
+
+- [ ] **R2-8 死碼 `_load_cached_urls`**
+  - 位置：`src/k2s_downloader/core/downloader.py`（`_load_cached_urls`，全 repo 無呼叫端也無測試）
+  - 問題：`download()` 開頭固定刪除 URL cache 檔再重建，`_load_cached_urls` 從未被呼叫 —— 「URL 快取重用」這個功能只做了寫入端。download URL 本身有時效，跨 session 重用價值本來就低。
+  - 建議做法：直接刪除該 method（連同評估 `url_cache_path`/`urls.json` 是否還有存在必要 —— 若只剩除錯用途，在 docstring 註明）。
+
+## R2-P3 — Windows exe 打包（PyInstaller）
+
+- [ ] **R2-9 exe 打包整備**：基礎已可行 —— `gui/app.py` 已處理 `sys._MEIPASS` 資源路徑、`pyproject.toml` 已有 `[build]` extra（`pyinstaller>=6.16.0`）、`core/` 無 GUI 依賴。但以下缺口需補齊（依阻斷程度排序）：
+  1. **（阻斷）可寫路徑問題**：`tmp/`、`urls.json`、`proxies.txt` 與最終下載檔全部寫在 CWD。雙擊 exe 時 CWD 是 exe 所在目錄，裝在 `Program Files` 下會直接 `PermissionError`。`Downloader` 已有 `tmp_dir`/`url_cache_path`/`proxy_cache_path` 參數但 `gui/worker.py` 全用預設值 —— 需改為使用者資料目錄（`QStandardPaths.AppDataLocation`），並在 GUI 加「下載儲存位置」選擇（目前完全沒有）。
+  2. **（阻斷，同 R2-4）** 檔名 sanitize 必須先修，否則 Windows 上高機率第一次下載就失敗。
+  3. **spec 檔／build 腳本**：尚無。需要 `--windowed --icon src/assets/icon/icon.ico`、`--add-data resources/style.qss;resources`、`--add-data src/assets/icon/icon.ico;assets/icon`（對應 `_resource_path` 期望的 `_MEIPASS` 內相對路徑）。建議 onedir 而非 onefile（onefile 較易觸發 Defender/SmartScreen 誤報，且啟動慢）；未簽章 exe 的 SmartScreen 警告需在 Readme 說明。
+  4. **需要「去除」的元素**：CLI 入口（`k2s-downloader`）不要包進 windowed exe —— `default_captcha_callback` 用 `Image.show()` + `input()`，windowed 模式無 stdin 會掛死；GUI 有自己的 captcha callback 不受影響。若也要發佈 CLI exe，需另出 console build。tqdm/print 在 windowed 下無害（GUI 路徑 `show_console_progress=False`）。
+  5. **不打包的外部依賴**：`ffmpeg` 維持現狀（`which("ffmpeg")` 找不到就跳過媒體檢查），在發佈說明註明即可。體積優化（PySide6 excludes）為選配。
+  6. 建議加一個 CI job（或至少文件化的本機指令）驗證打包產物能啟動。
+
+## R2-P4 — proxy 來源與生命週期管理（回應「proxyscrape 過時 proxy」問題）
+
+- [ ] **R2-10 proxy pool 品質改善**。現況：單一來源 `api.proxyscrape.com`（**v1 舊版 API**，官方已遷移至 v2/v3，v1 隨時可能停止服務 —— 屆時 `fetch_remote` 拿到空清單、退化成純直連而無明顯錯誤）；驗證只打 `api.myip.com`；`proxies.txt` 快取無 TTL；`working_proxy_indexes` 只進不出。免費公開 proxy 本質就是高汰換率＋MITM 風險（見 P2-3），**換一家來源只能緩解、不能根治**，重點應放在驗證與生命週期：
+  1. **升級／多來源**：改用 proxyscrape v2 endpoint，並把來源抽象成 provider 清單，聚合 GitHub 上定時更新的免費清單（如 `TheSpeedX/PROXY-List`、`monosans/proxy-list`、`proxifly/free-proxy-list` 的 raw URL）後去重 —— 多來源聯集能顯著提高「當下活著」的比例。
+  2. **驗證目標對齊**：`api.myip.com` 可達 ≠ 該 proxy 沒被 Keep2Share 封鎖。驗證改為（或加驗）對 `k2s.cc` 的輕量請求，直接篩掉對目標站無效的 proxy。（共享的公開 proxy 很可能早已被 k2s 封鎖或限制，這點讓「對目標站實測」比「泛用可達性檢查」重要得多。）
+  3. **快取 TTL**：`proxies.txt` 加時間戳，超過（例如 6~24 小時）自動視為過期觸發 refresh；啟動時可預設走已有的 `recheck_cached` 路徑。
+  4. **Runtime 降級**：proxy 進入 `working_proxy_indexes` 後即使開始連續失敗仍會被優先選中 —— 對每個 index 記錄連續失敗次數，超閾值即自 working 清單移除。
+  5. **使用者自備清單**：CLI flag／GUI 匯入自有 proxy 清單，讓在意 MITM 的使用者完全繞開公開清單。
+  6. 非 proxy 替代方案評估過不採用：Tor（免費多出口但慢、出口常被檔案站封鎖）、免費 VPN（不可程式化輪替）。是否真的需要 proxy，由 R2-11 的量測數據決定。
+
+## R2-P5 — 根本目的（突破 50KB/s）達成度檢視
+
+- [ ] **R2-11 用量測數據驗證加速機制、據此決定 proxy 架構去留**
+  - **現況評估**：對照根本目的（瀏覽器免費下載被限 50KB/s），加速機制在程式碼層面已完整 —— 單次 captcha → 產生 N 個 download token → byte-range 並行下載 → 直連優先＋proxy fallback＋重試/backoff＋取消＋CLI/GUI 雙前端，且第一輪 P0~P5 已把掛死/損毀類缺陷清完。**「紙面上」目的已達成，但缺實測數據佐證**（本輪環境無法連 Keep2Share 驗證）。
+  - **已知事實（2026-07-17 使用者第一手經驗；除最後一點外皆為本 app 實際使用觀察）**：
+    - website（free plan）下載被限 50KB/s，且 browser 下載非常容易中斷（原因不明）—— 這兩點是本 app 存在的原始動機。
+    - **本 app 通過 captcha 開始下載後，實測速度約 1~3MB/s** —— 相對 50KB/s 是 20~60 倍加速，**主體下載階段的根本目的已實際達成**。
+    - **下載 >9GB 的大檔時，接近 99% 完成度速度會掉到約 10~50KB/s**（詳見 R2-12 的成因分析與對策）。
+    - 「同一 IP 累計約 9GB 後被封鎖一到兩天、換動態 IP 即恢復」為 website 使用時期的**體感推測，未經證實**——依使用者判斷，**不做專用的 9GB 偵測/計量功能**，只保留通用的「疑似被封鎖」提示。
+  - **由 1~3MB/s 這個數字可得的推論**：聚合速度 ≈ 連線數 × 50~150KB/s，強烈暗示免費限速是 **per-connection（per-token）** 而非 per-IP 總量 —— 這正是本 app 多 token 並行設計能生效的原因。待 telemetry 佐證後，proxy pool 的定位可再收斂（另注意：`_acquire_proxy_lock` 的直連 slot 只有一個 lock，同時間僅一條 chunk 走直連，其餘都經 proxy —— 1~3MB/s 的流量組成到底直連佔多少、proxy 佔多少，是 telemetry 要回答的第二個問題）。
+  - 建議做法：
+    1. 增加 per-chunk／per-proxy 吞吐統計（經由既有 `status_callback`／GUI dev panel 呈現，`core/` 不加 print/logging），驗證上述 per-connection 推論，並量測直連 vs proxy 的流量占比。
+    2. 依數據調整預設：若直連並行即可滿速，proxy 改為 opt-in，砍掉最大風險面。
+    3. 偵測到疑似封鎖（`ChunkDownloadFailed`／captcha 連續被拒）時，狀態訊息提示「若為動態 IP，可嘗試重啟數據機換 IP 後重試」（零成本、比依賴不可信 proxy 安全；不涉及任何額度計量）。
+    4. （選配）提供「匯出 download URLs 為 aria2c input file」功能，複用成熟分段下載引擎作 A/B 對照與備援路徑。
+  - **附帶事實記錄**：排程迴圈的 part 檔重用分支（size 相符即採用）已天然提供同機續傳雛形 —— 中斷後重跑會跳過已完成的 part，只差「URL 過期後重新產生再接續」的串接；spec 將跨 process 續傳列為 out-of-scope，若未來要做，從這裡接最省力。大檔（>9GB）下載中斷後接續的場景讓這條路線價值不低。
+
+- [ ] **R2-12 大檔接近 99% 時速度崩落（10~50KB/s）的成因與對策**
+  - **現象**（使用者實測）：>9GB 檔案下載至約 99% 時，速度從 1~3MB/s 掉到 10~50KB/s。
+  - **最可能成因：平行度尾端崩落（long-tail collapse），不需要任何「額度碰頂」假設**。固定 20MiB split 下，>9GB 檔 ≈ 460+ 個 chunk、20 條連線；當「剩餘 chunk 數 < 連線數」時，活躍連線隨完成逐一歸零，最後只剩 1~2 條 —— 聚合速度自然掉回**單連線速度**，而觀察到的 10~50KB/s 恰好就是免費 per-connection 限速的量級，與推論吻合。最後一個 20MiB chunk 以 50KB/s 下載需時約 7 分鐘，體感上就是「卡在 99% 很久」。
+  - **次要成因（可並存）：倒楣 chunk 的重試損耗**。尾端殘留的常是反覆失敗的 chunk：每次失敗整段 buffer 丟棄、進度回退（`_report_progress(-chunk_bytes)`）、backoff 最長 30s、下次還可能抽到另一個爛 proxy —— 有效吞吐趨近於零。R2-10 第 4 點（proxy 失敗降級）與 R2-7（改寫入暫存檔）都會直接改善這一項。
+  - 對策選項（由簡到難）：
+    1. **尾端優先直連**：剩餘 chunk 數低於門檻時，改為優先等待直連 slot 而非退而求其次抽 proxy（直連品質通常最穩，尾端最忌諱抽到爛 proxy 重來）。改動小。
+    2. **尾端 chunk 冗餘派工（speculative duplication）**：剩餘 chunk < 空閒連線數時，把同一 range 同時派給多條空閒連線，先完成者勝、其餘取消。頻寬浪費有限（只發生在尾端），實作比動態切分簡單，aria2 類工具的常見手法。
+    3. **動態範圍再切分（work stealing）**：尾端把仍在下載中的大 range 對半分給空閒連線。效果最好但需要支援「部分 range 的銜接合併」，改動最大。
+    4. （輔助）縮小預設 split size 或改用「檔案越大、尾段 split 越小」的遞減切分 —— 直接縮短尾端長度，零架構改動，可先行。
+  - **驗證方式**：R2-11 的 telemetry 先行 —— 尾端同時記錄「活躍連線數」與「聚合速度」，若兩者同步下降即證實主因是平行度崩落（而非封鎖/額度），再依數據挑選上面哪個對策。
+  - 測試：以 mock 驗證尾端派工策略（冗餘派工的先完成者勝出、輸家取消不寫檔）；切分策略的 ranges 正確性沿用 `TestBuildRangesContiguity` 模式。
+
+---
+
 ## 建議處理順序
 
 1. ~~先做 **P0-1、P0-2** 並同步補 **P3-1、P3-2**（純函式、好測、風險高）。~~ ✅ 已完成
@@ -195,5 +306,8 @@
 > 所有測試（本機 `.venv`，`pytest -q`，`pyproject.toml` 已設 `pythonpath=["src"]` 免手動設環境變數）
 > 共 74 個全數通過（連續跑 5 次確認無 flaky），`ruff check .` 全過。
 >
-> **todolist 的 P0 ~ P5 六個優先級目前皆已全數完成。** 若要繼續優化本專案，建議之後從頭重新檢視現況
-> （程式碼可能已有新變動）並開一輪新的優先序評估，而非假設此份 todolist 仍完整反映現狀。
+> **第一輪 P0 ~ P5 六個優先級皆已全數完成。** 2026-07-17 已依「重新從頭檢視現況」原則完成第二輪靜態
+> code review，新一輪 backlog 見上方「第二輪（R2）」段落（R2-1 ~ R2-11，全部未認領）。
+> 建議接手順序：R2-P0（並發 race，改動小、風險高）→ R2-4/R2-5（Windows 相容性，是 exe 打包的前置）
+> → R2-9（打包）→ 其餘依需求。R2-11 的 telemetry 是 R2-10（proxy 投資深度）與 R2-12（99% 尾端崩落
+> 對策選擇）共同的前置驗證，三項建議一起規劃；R2-12 的對策 4（縮小尾端 split）零架構改動可先行。
