@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking at K2S Downloader. This document covers the local dev setup, how to run tests/lint, and the conventions this repo follows.
+Thanks for looking at K2S Downloader. This document covers the local dev setup, how to run tests/lint, and the conventions this repo follows. For architecture/requirements docs and the AI-agent entry point, see [`AGENTS.md`](AGENTS.md), [`docs/ai/`](docs/ai/), and [`docs/human/`](docs/human/).
 
 ## Setup
 
@@ -29,11 +29,11 @@ Both commands also run in CI (`.github/workflows/ci.yml`) on every push to `main
 ## Code style
 
 - Follow the conventions already in the file you're editing over any external style guide.
-- Comments are English, even though this project's docs (`Readme.md`, `todolist.md`) are Traditional Chinese for the human-facing narrative. Code comments explain *why*, not *what* — skip a comment if the code is already self-explanatory.
+- Comments are English, even though some of this project's narrative docs (`Readme.md`, `docs/ai/todolist.md`, `docs/human/*.md`) are written in Traditional Chinese per this project's language convention (see `AGENTS.md` § Environment and language rules). Code comments explain *why*, not *what* — skip a comment if the code is already self-explanatory.
 - Prefer named constants over inline magic numbers, especially for timeouts (see `CHUNK_REQUEST_TIMEOUT`, `DEFAULT_TIMEOUT`, etc. in `src/k2s_downloader/core/`) so the reason for a specific value is discoverable and adjustable in one place.
 - The `core/` package (`downloader.py`, `k2s_client.py`, `proxy.py`) has no PySide6 dependency and should stay that way — it's what the CLI and the tests exercise directly. UI-specific logic belongs in `gui/`.
 - `core/` communicates with callers via constructor callbacks (`status_callback`, `progress_callback`, `proxy_state_callback`), not by printing or logging directly. This is what lets the same download logic drive both the CLI (`status_callback=print`) and the Qt GUI (callbacks wired to Qt signals in `gui/worker.py`) without core knowing which one it's talking to. Keep new caller-facing output going through these callbacks rather than adding new `print()`/`logging` calls inside `core/`.
-- When fixing a bug, prefer a minimal, targeted diff over an opportunistic rewrite of surrounding code — this repo's history (see `todolist.md`) tracks issues by priority tier (P0 = correctness/hangs, P1 = infra, P2 = robustness, ...) precisely so unrelated cleanup doesn't get tangled into a bug fix.
+- When fixing a bug, prefer a minimal, targeted diff over an opportunistic rewrite of surrounding code — this repo's history (see `docs/ai/todolist.md`) tracks issues by priority tier (P0 = correctness/hangs, P1 = infra, P2 = robustness, ...) precisely so unrelated cleanup doesn't get tangled into a bug fix.
 
 ## Testing conventions
 
@@ -48,10 +48,10 @@ This repo follows [Conventional Commits](https://www.conventionalcommits.org/) s
 
 ## Tracking ongoing work
 
-`todolist.md` is the living backlog for this project, organized by priority (P0 highest). If you're picking up an item from it: update its checkbox, completion date, and test location when you're done, and keep the original problem/location/suggestion text so the entry stays useful to whoever reads it next.
+`docs/ai/todolist.md` is the living backlog for this project, organized by priority (P0 highest). If you're picking up an item from it: update its checkbox, completion date, and test location when you're done, and keep the original problem/location/suggestion text so the entry stays useful to whoever reads it next.
 
 ## Pull requests
 
-- Keep PRs scoped to one priority-tier's worth of work where practical (see `todolist.md`'s tiers) rather than bundling unrelated fixes.
+- Keep PRs scoped to one priority-tier's worth of work where practical (see `docs/ai/todolist.md`'s tiers) rather than bundling unrelated fixes.
 - Include the `pytest -q` / `ruff check .` results (or note that CI covers it) in the PR description.
 - No CLA or sign-off is required; contributions are accepted under this repo's [MIT license](LICENSE).

@@ -1,19 +1,3 @@
 # Coder Agent System Instructions & Constraints
 
-你是一個專職於程式碼實作與修改的 Coder Agent。
-當你在本專案（yf24/k2s-Downloaderm）進行開發、修正與 Pull Request (PR) 處理時，請務必嚴格遵守以下開發守則。
-
-## ⚙️ 核心開發與自動修正守則 (Core Rules & Constraints)
-為了防止陷入「無限修改迴圈」並避免 Token 額度不必要地膨脹，你在執行代碼修正時，必須嚴格遵守以下三條安全防禦規則：
-
-### 1. 🔍 自動讀取 PR 評論
-當你提交 PR 後，如果需要針對 Review 進行修正，請使用你的 `github-coder` 相關工具去讀取該 PR 底下由雲端 AI Reviewer 留下的最新評論與回饋。
-
-### 2. 🛡️ 最小修改價值過濾 (Ignore Nitpicks)
-在閱讀 Review 意見時，請將問題進行分類：
-* **必須修正**：重大 Bug、邏輯漏洞、效能缺陷、安全性問題。
-* **直接忽略**：極微小的細節 (Nitpicks)，例如程式碼排版（空格/換行）、變數命名的些微偏好、無關緊要的註解修改或格式微調。請絕對不要為了這些細節重新 commit/push。
-
-### 3. 🛑 停損點限制 (Max 1 Iteration per instruction)
-* **一次對話只修正一次**：針對人類給你的修正任務，你在一輪對話中，只能修改並 Push **一次**。
-* **禁止主動輪詢**：Push 完成後請立即停止，**絕對不要**主動去讀取下一次自動觸發的 Review 評論。請靜待人類（我）確認後，下達下一步指令，交由人類做最後的 Merge 把關。
+> **本檔內容已併入根目錄的 `AGENTS.md`**（PR/Review 相關約束見 `AGENTS.md` 第 6 節，原本本檔的三條核心規則皆已逐字保留）。請改讀 [`AGENTS.md`](AGENTS.md)。本檔僅因目前的文件整理工具無法直接刪除檔案而保留，歡迎直接刪除。
