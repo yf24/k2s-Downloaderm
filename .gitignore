@@ -9,3 +9,4 @@ dist/
 tmp/
 urls.json
 proxies.txt
+.DS_Store

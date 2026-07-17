@@ -13,8 +13,6 @@
 
 `docs/ai/` 是 AI 適用的 canonical 版本（英文撰寫）；`docs/human/` 是對應的人類可讀繁體中文版本，內容應與 `docs/ai/` 保持同步。`Readme.md`（根目錄，大寫 R）是使用者導向的安裝／使用說明，不是架構文件。完整文件索引見 [`docs/README.md`](docs/README.md)。
 
-若你看到根目錄還留著 `readme-en.md`、`readme-zh.md`、`requirements-en.md`、`requirements-zh.md`、`todolist.md`、`.claudeprompt` 這幾個檔案，且內容只有一兩行「已搬移」提示，代表這些是 2026-07-17 文件整理後留下的轉址 stub（因當時串接的 GitHub 工具沒有刪除檔案的能力，詳見 [`docs/ai/HANDOFF.md`](docs/ai/HANDOFF.md)）。請直接依 stub 指向的新路徑閱讀，不要以舊檔內容為準；有能力的話歡迎直接刪除這些 stub 檔案。
-
 ## 1. 專案是什麼
 
 一個 Keep2Share（`k2s.cc`）檔案的平行下載工具。把單一檔案切成多個 byte-range 區塊，並行下載（可選第三方 HTTPS proxy pool 規避單一 IP 速率限制），完成後重組成目標檔案。CLI（`k2s-downloader`）與 PySide6 桌面 GUI（`k2s-downloader-gui`）共用同一套 `core` 引擎。

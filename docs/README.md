@@ -21,7 +21,3 @@
 - [`Readme.md`](../Readme.md) — 使用者安裝／使用說明（`pyproject.toml` 的 `readme` 欄位也指向此檔，不能搬動）
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — 貢獻／開發流程、code style、測試慣例、commit 格式
 - [`AGENTS.md`](../AGENTS.md) — AI agent／Coder agent 進入本專案前的第一份文件（導覽 + 硬規則速查 + PR 工作流程）
-
-## 已知限制
-
-舊路徑（`readme-en.md`、`readme-zh.md`、`requirements-en.md`、`requirements-zh.md`、`todolist.md`、`.claudeprompt`）目前仍留在根目錄，但內容已改成指向新位置的簡短提示（stub）。受限於目前串接的 GitHub 工具沒有刪除檔案的能力，這些 stub 檔案無法直接移除；需要另外用 `git rm` 或 GitHub 網頁介面手動刪除，詳見對應 PR 的說明。
