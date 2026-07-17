@@ -15,13 +15,16 @@ src/k2s_downloader/
 └── gui/                  # PySide6 前端，只透過 core/ 的 callback 介面互動
     ├── app.py              # QApplication 啟動、載入 stylesheet／icon
     ├── main_window.py      # MainWindow：所有 widget、signal 連接、UI thread 狀態
-    └── worker.py           # DownloadWorker / ProxyLoaderWorker：包住 core.Downloader 的 QThread
+    ├── worker.py           # DownloadWorker / ProxyLoaderWorker：包住 core.Downloader 的 QThread
+    └── paths.py            # 透過 QStandardPaths 提供 app_data_dir() / default_download_dir()（R2-9）
 
 k2s_gui_entry.py          # 給 PyInstaller 打包用的輕量入口腳本 -> gui.app.main()
 tests/                    # 對應 core/ 各模組；所有 requests 呼叫都 mock；不含 GUI 測試（見 NFR-4）
 ```
 
 `core/` 是唯一包含商業邏輯的套件。`cli.py` 與 `gui/` 都只是薄前端：建立 `Downloader`、接上 callback／signal，其餘不介入。
+
+**檔案存放位置（R2-9）**：`Downloader` 建構子的 `tmp_dir`／`url_cache_path`／`proxy_cache_path` 參數預設是不含路徑的裸名稱（`tmp`、`urls.json`、`proxies.txt`），會相對於 process 的 CWD 解析 —— CLI 沒問題（CWD 就是使用者選擇執行的位置），但雙擊啟動的 GUI exe 的 CWD 是執行檔自己的安裝目錄，可能沒有寫入權限（例如裝在 `Program Files` 下）。`gui/paths.py::app_data_dir()` 透過 `QStandardPaths.AppDataLocation` 解析出每使用者可寫入的資料夾（需要在任何 GUI 程式碼執行前，於 `gui/app.py::main()` 呼叫 `QApplication.setOrganizationName`／`setApplicationName`）；`gui/worker.py::DownloadWorker.run()`／`ProxyLoaderWorker.run()` 把該資料夾底下的 `tmp`／`urls.json`／`proxies.txt` 子路徑傳給 `Downloader`／`get_working_proxies()`，取代原本依賴 CWD 的預設值。另外，`Downloader.download()` 新增一個可選的 `output_dir` 參數（透過 `_apply_output_dir` 套用，只保留解析後檔名的最後一段路徑成分再與 `output_dir` 組合 —— 檔名本身若帶有目錄成分會被捨棄，避免逃出呼叫端指定的 `output_dir`），讓 GUI 的「下載儲存位置」選擇器（`main_window.py`，預設帶入 `QStandardPaths.DownloadLocation`）能控制**完成後**的檔案存放位置，與上述的暫存／快取位置互相獨立。CLI 從不傳入 `output_dir`，原本依賴 CWD 的行為（含 R2-5 的 `--filename out/video.mp4` 這類帶目錄成分的用法）維持不變。
 
 ## 2. 控制流程
 

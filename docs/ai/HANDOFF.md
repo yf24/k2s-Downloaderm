@@ -4,6 +4,7 @@
 
 ## 現況（2026-07-17）
 
+- **R2-9（PyInstaller Windows exe 打包整備）2026-07-17 完成**（本 session 在 Windows 環境下進行，已解除先前「需要 Windows 才能驗證，暫緩」的狀態）：新增 `output_dir` 參數（`Downloader.download()`）＋ `gui/paths.py`（`QStandardPaths` 解析 app-data／Downloads 目錄）＋ GUI「Save to」資料夾選擇器＋ `k2s_gui.spec`；本機安裝 `PySide6`/`pyinstaller` 到專案 `.venv` 後實際跑過 `pyinstaller k2s_gui.spec` 建置、確認資源檔落在 `_internal/` 下、啟動建置出的 `K2SDownloaderm.exe` 確認 process 常駐後 kill 收尾。細節見 `docs/ai/todolist.md` R2-9 項。尚未做：GitHub Actions 的 Windows packaging CI job（現有 `ci.yml` 只有 ubuntu runner）。
 - todolist（`docs/ai/todolist.md`）第一輪 P0~P5 全數完成並已**封存**至 [`docs/ai/todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md)（R2-15 的成果，見下方）；第二輪 R2-1 ~ R2-15 的現況見該檔「第二輪（R2）」段落。
 - **R2-P0（R2-1 ~ R2-3 三個並發 race）已於 2026-07-17 修正並 merge**（[PR #11](https://github.com/yf24/k2s-Downloaderm/pull/11)，merge commit `7284460`）。
 - **R2-4 + R2-5（Windows 檔名 sanitize、part 檔路徑扁平化）已於 2026-07-17 修正並 merge**（[PR #12](https://github.com/yf24/k2s-Downloaderm/pull/12)，merge commit `7c6dc04`）。
@@ -27,7 +28,7 @@
 2. **R2-11 的 PR 尚未 review／merge**（見上方「現況」）。下一個 agent 若被要求「處理 review 意見」，依 `AGENTS.md` 第 6 節規則：讀取 PR 上的最新 AI reviewer 留言、只處理 Critical/嚴重 Improvement、忽略 nitpick、一輪對話只 push 一次，push 完就停止等人類 merge。
 3. **R2-11 的核心決策（是否讓 proxy 變 opt-in）需要真實使用數據**：這次新增的 telemetry 只是量測工具本身，實際判斷要等使用者拿這個版本跑過幾次真實下載、觀察 log 裡的「Throughput: ... direct: X%, proxy: Y%」訊息後才能做。
 4. **R2-13 的 GUI 可見性子項未做**：暫存目錄路徑顯示＋「開啟資料夾」按鈕（見 `docs/ai/todolist.md` R2-13 項下的未完成子項說明）。
-5. **R2-9（PyInstaller 打包）需要 Windows 環境才能真正建置/驗證**，已與使用者確認暫緩，先處理其他不需要 Windows 的項目（R2-6、R2-8、R2-11 皆已依此原則完成）。
+5. ~~R2-9（PyInstaller 打包）需要 Windows 環境才能真正建置/驗證~~ —— 已於本 session（Windows 環境）完成，見上方「現況」。若要再加強，可考慮補一個 GitHub Actions 的 Windows packaging CI job（目前 `ci.yml` 只有 ubuntu runner，未包含 PySide6/pyinstaller）。
 6. **`.github/scripts/test_ai_review.py` 實際上不在任何 CI 步驟中執行**（`pyproject.toml` 的 `testpaths=["tests"]` 排除了 `.github/scripts/`，`ai-review.yml` workflow 也只跑腳本本身不跑 pytest）。R2-14 順手發現但未處理（範疇外）；若要修，選項包括把 `testpaths` 擴大或替 `ai-review.yml` 加一個跑這份測試的步驟，需先確認要不要把 `anthropic`/`PyGithub` 也拉進 `.[dev]` extras。
 
 ## 給下一個 agent 的建議起點

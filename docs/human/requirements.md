@@ -76,6 +76,8 @@
 - **AC-10.2**：背景下載 thread 傳來的進度、狀態訊息、proxy 狀態更新，在送到 UI thread 前都會先節流（固定的 tick 間隔），避免高 thread 數造成過量 signal 流量把 UI 卡死。
 - **AC-10.3**：需要 captcha 時會直接嵌入顯示在 GUI 內（圖片＋文字輸入框），而非卡在終端機提示；送出後會解除背景下載 thread 的阻塞。
 - **AC-10.4**：下載進行中關閉主視窗會觸發取消，並在有限時間內等待 worker thread 停止後才讓 process 結束。
+- **AC-10.5**：GUI 提供明確的「下載儲存位置」資料夾選擇器（預設帶入系統的下載資料夾），用來控制完成後的檔案存放位置；此設定與 AC-10.6 的暫存／快取位置互相獨立，選擇存放位置不需要碰到暫存目錄。
+- **AC-10.6**：GUI 完全不依賴 process 的當前工作目錄（CWD）可寫入 —— 暫存檔、URL 快取除錯用檔案、proxy 快取全部存放在執行期解析出的每使用者應用程式資料目錄下，因此打包成獨立 Windows 執行檔後，即使從唯讀的安裝位置（例如 `Program Files`）啟動也能正常運作。
 
 ### REQ-11：透過磁碟上的 manifest 實現斷點續傳
 - **AC-11.1**：每次下載都會維護一份續傳 manifest（暫存目錄下的 `<filename>.manifest.json`），記錄 Keep2Share 的 file ID、總大小、split size、split 數量，以及每個區段的完成狀態；區段完成時會即時更新，合併成功後會被刪除（檔案已完整組出來，就沒有東西需要續傳了）。
@@ -89,7 +91,7 @@
 - **NFR-2（並發安全）**：多個區塊下載 thread 共用的可變狀態（已知可用 proxy 清單、活躍 proxy 集合、進度計數器）都由專屬的 lock 保護；沒有任何欄位在無 lock 保護下被多個 thread 讀取-修改-寫入。
 - **NFR-3（可攜性）**：`core/` 不依賴任何 GUI toolkit；必須能在未安裝 PySide6 的環境下獨立 import 與測試。
 - **NFR-4（測試覆蓋）**：每個 bug 修復都要附上對應的迴歸測試（放在 `tests/`），該測試在修復前的程式碼上要能重現失敗。`gui/` 是唯一有記載的例外（`# pragma: no cover - GUI wiring`）。
-- **NFR-5（平台）**：開發與測試環境為 Windows + Python 3.13；`pyproject.toml` 宣告最低支援 Python 3.9，CI 也會針對這個下限版本執行。
+- **NFR-5（平台）**：開發與測試環境為 Windows + Python 3.13；`pyproject.toml` 宣告最低支援 Python 3.9，CI 也會針對這個下限版本執行。GUI 另可透過 PyInstaller 打包成獨立 Windows 執行檔（`k2s_gui.spec`；對應 `[build]` optional-dependency 群組）—— 詳見 [Readme.md](../../Readme.md) 的「Building a Windows Executable」段落。
 - **NFR-6（區塊記憶體用量有界）**：區段資料一邊接收一邊直接串流寫入其 `.partNNN.tmp` 檔（不會整段緩衝在記憶體中），且每次寫入後都會 flush，讓磁碟上的檔案漸進成長可見，而不是等到整段下載完才出現；重新命名成最終 `.partNNN` 名稱的動作是原子性的，且只在確認完整位元組數後才執行，因此下載到一半或中斷的嘗試絕不會被誤判為已完成的區段。
 
 ## 6. 目前已知限制

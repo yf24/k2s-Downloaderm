@@ -77,13 +77,8 @@
 
 ## R2-P3 — Windows exe 打包（PyInstaller）
 
-- [ ] **R2-9 exe 打包整備**：基礎已可行 —— `gui/app.py` 已處理 `sys._MEIPASS` 資源路徑、`pyproject.toml` 已有 `[build]` extra（`pyinstaller>=6.16.0`）、`core/` 無 GUI 依賴。但以下缺口需補齊（依阻斷程度排序）：
-  1. **（阻斷）可寫路徑問題**：`tmp/`、`urls.json`、`proxies.txt` 與最終下載檔全部寫在 CWD。雙擊 exe 時 CWD 是 exe 所在目錄，裝在 `Program Files` 下會直接 `PermissionError`。`Downloader` 已有 `tmp_dir`/`url_cache_path`/`proxy_cache_path` 參數但 `gui/worker.py` 全用預設值 —— 需改為使用者資料目錄（`QStandardPaths.AppDataLocation`），並在 GUI 加「下載儲存位置」選擇（目前完全沒有）。
-  2. **（阻斷，同 R2-4）** 檔名 sanitize 必須先修，否則 Windows 上高機率第一次下載就失敗。
-  3. **spec 檔／build 腳本**：尚無。需要 `--windowed --icon src/assets/icon/icon.ico`、`--add-data resources/style.qss;resources`、`--add-data src/assets/icon/icon.ico;assets/icon`（對應 `_resource_path` 期望的 `_MEIPASS` 內相對路徑）。建議 onedir 而非 onefile（onefile 較易觸發 Defender/SmartScreen 誤報，且啟動慢）；未簽章 exe 的 SmartScreen 警告需在 Readme 說明。
-  4. **需要「去除」的元素**：CLI 入口（`k2s-downloader`）不要包進 windowed exe —— `default_captcha_callback` 用 `Image.show()` + `input()`，windowed 模式無 stdin 會掛死；GUI 有自己的 captcha callback 不受影響。若也要發佈 CLI exe，需另出 console build。tqdm/print 在 windowed 下無害（GUI 路徑 `show_console_progress=False`）。
-  5. **不打包的外部依賴**：`ffmpeg` 維持現狀（`which("ffmpeg")` 找不到就跳過媒體檢查），在發佈說明註明即可。體積優化（PySide6 excludes）為選配。
-  6. 建議加一個 CI job（或至少文件化的本機指令）驗證打包產物能啟動。
+- [x] **R2-9 exe 打包整備**（2026-07-17 完成。實作：① 新增 `Downloader.download(..., output_dir=None)`（經 `_apply_output_dir` 套用，只取解析後檔名的最後一段與 `output_dir` 組合，捨棄檔名自帶的目錄成分，CLI 從不傳入故行為不變）；新增 `gui/paths.py`（`app_data_dir()` 用 `QStandardPaths.AppDataLocation`、`default_download_dir()` 用 `QStandardPaths.DownloadLocation`），`gui/app.py::main()` 補上 `setOrganizationName`/`setApplicationName`（`QStandardPaths.AppDataLocation` 依賴這兩者才能解析出穩定路徑）；`gui/worker.py` 的 `DownloadWorker`/`ProxyLoaderWorker` 改用 `app_data_dir()` 下的 `tmp`/`urls.json`/`proxies.txt`，`DownloadWorker` 新增 `output_dir` 參數並轉呼叫 `download()`；`gui/main_window.py` 加「Save to」資料夾欄位＋Browse 按鈕（`QFileDialog.getExistingDirectory`），預設值為 `default_download_dir()`。② 新增 `k2s_gui.spec`（onedir、`console=False`、`icon='src/assets/icon/icon.ico'`、`datas` 對應 `resources/style.qss` → `resources`、`src/assets/icon/icon.ico` → `assets/icon`，符合 `_resource_path` 對 `_MEIPASS` 內相對路徑的期待）；只打包 `k2s_gui_entry.py`（CLI 入口的 `default_captcha_callback` 用 `Image.show()`+`input()`，windowed 模式無 stdin 會掛死，故不包）。③ `Readme.md` 新增「Building a Windows Executable」段落（含指令、SmartScreen 警告說明、ffmpeg 不隨附的提醒）。④ 本機以 `pip install PySide6 pyinstaller` 到專案 `.venv` 後實測：`pyinstaller k2s_gui.spec` 建置成功、`resources/style.qss`／`assets/icon/icon.ico` 確認落在 `dist/K2SDownloaderm/_internal/` 下（PyInstaller ≥6 的 onedir 佈局，`_MEIPASS` 對應到 `_internal/`）、實際執行 `K2SDownloaderm.exe` 確認程序常駐（非啟動即崩潰）後 `taskkill` 收尾；`git status` 確認 `dist/`/`build/` 未被追蹤（`.gitignore` 本來就排除）。測試：`tests/test_downloader_filename_and_paths.py::TestApplyOutputDir`（3 項，覆蓋 output_dir 為 None／join／捨棄檔名自帶目錄成分）；核心測試套件（126 項）全數通過。文件：`docs/ai/requirements.md`/`docs/human/requirements.md` 新增 AC-10.5／AC-10.6、補充 NFR-5；`docs/ai/architecture.md`/`docs/human/architecture.md` module map 加 `gui/paths.py`、補「檔案存放位置」段落說明 app-data dir 與 output_dir 的分工。
+  - **未完成、有意識延後**：CI packaging job（原建議做法第 6 點的「加一個 CI job」半句）—— 本次以「本機手動建置＋實際啟動＋確認 process 常駐」驗證取代，未新增 GitHub Actions workflow（現有 `ci.yml` 只有 ubuntu runner、不含 PySide6/pyinstaller；要加 `windows-latest` job 且需要在真正有 Windows runner 的 CI 環境驗證過才能確保不是一個永遠紅燈的 job，本環境雖是 Windows 但屬於單次互動 session，不代表 GitHub Actions runner 的行為，故不在本輪新增，留給下次有 CI 存取權限時處理）。PySide6 excludes 體積優化（原第 5 點選配項）未做。
 
 ## R2-P4 — proxy 來源與生命週期管理（回應「proxyscrape 過時 proxy」問題）
 
@@ -172,13 +167,10 @@
 > 第一輪（P0 ~ P5）的處理順序與完成紀錄已隨該輪一併封存，見
 > [`todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md) 的「完成紀錄」段落。
 
-第二輪（R2-1 ~ R2-13）：R2-1~R2-8、R2-13 已完成；R2-11 部分完成（telemetry 與零成本提示已做，「依數據
-調整預設」需要真實使用數據才能決定，留待之後）（見各項狀態與 PR 連結）。R2-9、R2-10、R2-12 仍未認領。
-建議接手順序：R2-P0（並發 race，改動小、風險高）→ R2-4/R2-5（Windows 相容性，是 exe 打包的前置）
-→ **R2-7＋R2-13（串流寫入＋斷點續傳，使用者明確需求，兩項綁定實作）** → R2-9（打包，含 R2-9.1
-使用者資料目錄，與 R2-13 的 tmp 位置一起規劃）→ 其餘依需求。R2-10（proxy 投資深度）與 R2-12（99% 尾端
-崩落對策選擇）建議等 R2-11 的 telemetry 累積到真實使用數據後再決定；R2-12 的對策 4（縮小尾端 split）
-零架構改動可先行，不需要等數據。
+第二輪（R2-1 ~ R2-13）：R2-1~R2-9、R2-13 已完成；R2-11 部分完成（telemetry 與零成本提示已做，「依數據
+調整預設」需要真實使用數據才能決定，留待之後）（見各項狀態與 PR 連結）。R2-10、R2-12 仍未認領。
+R2-10（proxy 投資深度）與 R2-12（99% 尾端崩落對策選擇）建議等 R2-11 的 telemetry 累積到真實使用數據後
+再決定；R2-12 的對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。
 
 **R2-P6（R2-14、R2-15）** 是 2026-07-17 使用者直接提出的兩項流程／文件維護改善（review 留言截斷問題、
 todolist 歸檔機制），與上述 R2-1~R2-13 的程式碼修正屬不同性質；兩項皆已完成（見各項狀態）。本檔（含

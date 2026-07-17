@@ -8,6 +8,7 @@ from PySide6.QtCore import QThread, Signal
 
 from ..core.downloader import DownloadCancelled, Downloader
 from ..core.proxy import get_working_proxies
+from .paths import app_data_dir
 
 
 class DownloadWorker(QThread):  # pragma: no cover - Qt integration
@@ -24,6 +25,7 @@ class DownloadWorker(QThread):  # pragma: no cover - Qt integration
         url: str,
         *,
         filename: Optional[str],
+        output_dir: Optional[str],
         threads: int,
         split_size: int,
         ensure_media_check: bool,
@@ -32,6 +34,7 @@ class DownloadWorker(QThread):  # pragma: no cover - Qt integration
         super().__init__(parent)
         self.url = url
         self.filename = filename
+        self.output_dir = output_dir
         self.threads = threads
         self.split_size = split_size
         self.ensure_media_check = ensure_media_check
@@ -135,7 +138,14 @@ class DownloadWorker(QThread):  # pragma: no cover - Qt integration
         self._captcha_event.set()
 
     def run(self) -> None:
+        # A double-clicked exe's CWD may not be writable (e.g. under Program
+        # Files) -- tmp/cache files go under the per-user app data dir
+        # instead of the process CWD default. See R2-9.
+        data_dir = app_data_dir()
         downloader = Downloader(
+            tmp_dir=data_dir / "tmp",
+            url_cache_path=data_dir / "urls.json",
+            proxy_cache_path=data_dir / "proxies.txt",
             status_callback=self.status.emit,
             progress_callback=self._progress_callback,
             proxy_state_callback=self._proxy_state_callback,
@@ -147,6 +157,7 @@ class DownloadWorker(QThread):  # pragma: no cover - Qt integration
             output_path = downloader.download(
                 self.url,
                 filename=self.filename,
+                output_dir=self.output_dir,
                 threads=self.threads,
                 split_size=self.split_size,
                 captcha_callback=self._captcha_callback,
@@ -187,6 +198,7 @@ class ProxyLoaderWorker(QThread):  # pragma: no cover - proxy refresh
     def run(self) -> None:
         try:
             proxies = get_working_proxies(
+                cache_path=app_data_dir() / "proxies.txt",
                 refresh=self.refresh,
                 status_callback=self.status.emit,
                 max_candidates=self.max_candidates,
