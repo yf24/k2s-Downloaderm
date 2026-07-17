@@ -9,8 +9,9 @@ import re
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence
 
 import requests
 from shutil import which
@@ -55,6 +56,32 @@ CHUNK_REQUEST_TIMEOUT = 20
 # same value as CHUNK_REQUEST_TIMEOUT today, but they control different
 # things and are kept as separate constants.
 CHUNK_STALL_TIMEOUT = 20
+
+
+@dataclass(frozen=True)
+class _DownloadContext:
+    """Per-`_download_once`-invocation values shared by every chunk thread.
+
+    Bundled into one immutable object so `_run_scheduling_loop` /
+    `_download_chunk` / `_report_progress` don't each need to thread five
+    separate keyword arguments through (the signatures got unwieldy when
+    these were split out of the old monolithic `_download_once`).
+    """
+
+    urls: Sequence[str]
+    filename: str
+    headers: Dict[str, str]
+    threads: int
+    split_count: int
+    progress_bar: tqdm
+
+
+class FailedChunk(NamedTuple):
+    """A chunk that exhausted its retry budget in ``_run_scheduling_loop``."""
+
+    chunk_idx: str
+    last_error: str
+    attempt_count: int
 
 
 class DownloadCancelled(RuntimeError):
@@ -124,13 +151,16 @@ def parse_size(size: str) -> int:
 
 
 def human_readable_bytes(num: int) -> str:
-    units = ["bytes", "KB", "MB", "GB", "TB"]
+    # Divides by 1024 at each step, so the unit labels are IEC binary
+    # (KiB/MiB/...), matching gui/main_window.py's _format_speed. Previously
+    # labelled "KB"/"MB"/... (the SI/decimal names) despite the binary math.
+    units = ["bytes", "KiB", "MiB", "GiB", "TiB"]
     value = float(num)
     for unit in units:
         if value < 1024.0:
             return f"{value:3.3f} {unit}"
         value /= 1024.0
-    return f"{value:3.3f} PB"
+    return f"{value:3.3f} PiB"
 
 
 class Downloader:
@@ -386,19 +416,10 @@ class Downloader:
         with self.url_cache_path.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=4)
 
-    def _download_once(
-        self,
-        urls: Sequence[str],
-        filename: str,
-        threads: int,
-        bytes_per_split: int,
-    ) -> Path:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
-        }
+    def _fetch_total_size(self, url: str, headers: Dict[str, str]) -> int:
         try:
             head_response = requests.head(
-                urls[-1],
+                url,
                 allow_redirects=True,
                 headers=headers,
                 timeout=HEAD_REQUEST_TIMEOUT,
@@ -415,181 +436,199 @@ class Downloader:
         total_size = int(size_in_bytes)
         if total_size < 0:
             total_size = total_size + 2**32
-        self._total_bytes = total_size
-        self._bytes_downloaded = 0
-        self._done_count = 0
+        return total_size
 
-        split_count = max(1, math.ceil(total_size / bytes_per_split))
-        ranges = self._build_ranges(total_size, split_count)
-        self._ranges_total = len(ranges)
-        self.url_locks = [threading.Lock() for _ in range(threads)]
+    def _report_progress(self, delta: int, ctx: _DownloadContext) -> None:
+        if delta == 0:
+            return
+        with self._progress_lock:
+            self._bytes_downloaded += delta
+            downloaded = self._bytes_downloaded
+            done = self._done_count
+        if self.progress_callback:
+            self.progress_callback(downloaded, self._total_bytes, done, self._ranges_total)
+        if not ctx.progress_bar.disable:
+            ctx.progress_bar.update(delta)
 
-        progress_bar = tqdm(
-            desc=f"[0/{len(ranges)}] Downloaded",
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-            disable=not self.show_console_progress,
-        )
+    def _download_chunk(
+        self,
+        index: str,
+        range_meta: Dict[str, object],
+        thread_index: int,
+        ctx: _DownloadContext,
+    ) -> None:
+        """Download a single byte-range chunk in its own thread.
 
-        stop = False
+        Cancellation is communicated purely via ``self.stop_event`` -- there
+        used to also be a ``nonlocal stop`` flag mirrored from here into the
+        scheduling loop (now ``_run_scheduling_loop``), but every path that
+        set it did so only when ``self.stop_event`` was already set (or being
+        set in the same statement), making it entirely redundant with -- and
+        a source of unnecessary shared mutable state across threads compared
+        to -- checking ``self.stop_event`` directly.
+        """
+        if self.stop_event.is_set():
+            return
 
-        def report_progress(delta: int) -> None:
-            if delta == 0:
-                return
-            with self._progress_lock:
-                self._bytes_downloaded += delta
-                downloaded = self._bytes_downloaded
-                done = self._done_count
-            if self.progress_callback:
-                self.progress_callback(downloaded, self._total_bytes, done, self._ranges_total)
-            if not progress_bar.disable:
-                progress_bar.update(delta)
+        chunk_range = range_meta["range"]  # type: ignore[index]
+        expected_bytes = int(range_meta["bytes"])  # type: ignore[arg-type]
+        tmp_filename = self.tmp_dir / f"{ctx.filename}.part{str(index).zfill(len(str(ctx.split_count)))}"
 
-        def download_chunk(index: str, range_meta: Dict[str, object], thread_index: int) -> None:
-            nonlocal stop
+        chunk_start_time = time.time()
+        buffer = io.BytesIO()
 
-            if self.stop_event.is_set():
-                stop = True
-                return
+        added_to_active = False
+        proxy_idx_or_none = self._acquire_proxy_lock()
+        if proxy_idx_or_none is None:
+            return
+        proxy_idx: int = proxy_idx_or_none
 
-            chunk_range = range_meta["range"]  # type: ignore[index]
-            expected_bytes = int(range_meta["bytes"])  # type: ignore[arg-type]
-            tmp_filename = self.tmp_dir / f"{filename}.part{str(index).zfill(len(str(split_count)))}"
+        proxy_value = self.proxies[proxy_idx]
+        # NOTE: the proxy connection itself is unauthenticated plain
+        # HTTP even though the target URL is HTTPS -- requests tunnels
+        # HTTPS through an HTTP CONNECT to this proxy, so the proxy
+        # operator sits in a position to observe/tamper with traffic.
+        # Combined with proxies.txt being sourced from a public,
+        # unauthenticated scraper (see proxy.py), do not rely on this
+        # path for sensitive downloads. _acquire_proxy_lock() already
+        # prefers the direct connection (index 0) over any proxy.
+        prox = {"https": f"http://{proxy_value}"} if proxy_value else None
+        added_to_active = True
+        with self._proxy_state_lock:
+            self._active_proxy_indexes.add(proxy_idx)
+        self._notify_proxy_state()
 
-            chunk_start_time = time.time()
-            buffer = io.BytesIO()
-
-            added_to_active = False
-            proxy_idx = self._acquire_proxy_lock()
-            if proxy_idx is None:
-                stop = True
-                return
-
-            proxy_value = self.proxies[proxy_idx]
-            # NOTE: the proxy connection itself is unauthenticated plain
-            # HTTP even though the target URL is HTTPS -- requests tunnels
-            # HTTPS through an HTTP CONNECT to this proxy, so the proxy
-            # operator sits in a position to observe/tamper with traffic.
-            # Combined with proxies.txt being sourced from a public,
-            # unauthenticated scraper (see proxy.py), do not rely on this
-            # path for sensitive downloads. _acquire_proxy_lock() already
-            # prefers the direct connection (index 0) over any proxy.
-            prox = {"https": f"http://{proxy_value}"} if proxy_value else None
-            added_to_active = True
-            with self._proxy_state_lock:
-                self._active_proxy_indexes.add(proxy_idx)
-            self._notify_proxy_state()
-
+        try:
             try:
-                try:
-                    response = requests.get(
-                        urls[thread_index],
-                        headers={"Range": f"bytes={chunk_range}", "User-Agent": headers["User-Agent"]},
-                        stream=True,
-                        proxies=prox,
-                        timeout=CHUNK_REQUEST_TIMEOUT,
-                    )
+                response = requests.get(
+                    ctx.urls[thread_index],
+                    headers={"Range": f"bytes={chunk_range}", "User-Agent": ctx.headers["User-Agent"]},
+                    stream=True,
+                    proxies=prox,
+                    timeout=CHUNK_REQUEST_TIMEOUT,
+                )
 
-                    if response.status_code not in (200, 206):
-                        # A non-success status (403/429/5xx, etc.) usually means
-                        # this proxy or our own IP has been blocked/rate-limited
-                        # by the host. Previously this was ignored and only
-                        # caught later by a coincidental byte-count mismatch;
-                        # detecting it here lets the range be retried sooner
-                        # and lets us record *why* it failed for the caller.
-                        response.close()
-                        self._mark_chunk_failed(
-                            range_meta,
-                            f"HTTP {response.status_code} via proxy {proxy_value or 'LOCAL'}",
-                        )
-                        return
-
-                    for data in response.iter_content(self.block_size):
-                        if self.stop_event.is_set():
-                            stop = True
-                            break
-                        if chunk_start_time + CHUNK_STALL_TIMEOUT < time.time():
-                            break
-                        chunk_start_time = time.time()
-                        buffer.write(data)
-                        report_progress(len(data))
-                except requests.exceptions.RequestException as exc:
-                    # Network-level failure (connection error, read timeout,
-                    # a chunked-encoding error mid-stream, etc.). Previously
-                    # a bare ``contextlib.suppress(Exception)`` swallowed
-                    # this entirely, so the only visible symptom was a
-                    # coincidental "size mismatch" below with no indication
-                    # of *why* the request actually failed.
+                if response.status_code not in (200, 206):
+                    # A non-success status (403/429/5xx, etc.) usually means
+                    # this proxy or our own IP has been blocked/rate-limited
+                    # by the host. Previously this was ignored and only
+                    # caught later by a coincidental byte-count mismatch;
+                    # detecting it here lets the range be retried sooner
+                    # and lets us record *why* it failed for the caller.
+                    response.close()
                     self._mark_chunk_failed(
                         range_meta,
-                        f"request error via proxy {proxy_value or 'LOCAL'}: {exc}",
+                        f"HTTP {response.status_code} via proxy {proxy_value or 'LOCAL'}",
                     )
                     return
 
-                chunk_bytes = len(buffer.getvalue())
-                if not math.isclose(chunk_bytes, expected_bytes, abs_tol=1):
-                    report_progress(-chunk_bytes)
-                    self._mark_chunk_failed(
-                        range_meta, f"size mismatch: got {chunk_bytes} expected {expected_bytes}"
-                    )
-                    if self.url_locks[thread_index].locked():
-                        self.url_locks[thread_index].release()
-                    return
-
-                range_meta.pop("last_error", None)
-                tmp_filename.write_bytes(buffer.getvalue())
-                with self._working_proxy_lock:
-                    is_newly_known = proxy_idx not in self.working_proxy_indexes
-                    if is_newly_known:
-                        self.working_proxy_indexes.append(proxy_idx)
-                if is_newly_known:
-                    self._notify_proxy_state()
-
-                range_meta["inUse"] = False
-                range_meta["downloaded"] = True
-
-                with self._progress_lock:
-                    self._done_count += 1
-                    done = self._done_count
-                if not progress_bar.disable:
-                    progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
-                if self.progress_callback:
-                    self.progress_callback(self._bytes_downloaded, self._total_bytes, done, self._ranges_total)
-            except Exception as exc:  # noqa: BLE001 - a chunk thread must never crash
-                # silently and leave range_meta["inUse"] stuck at True forever
-                # (the scheduling loop would then wait on this range forever).
-                # Anything unexpected past the request/streaming stage (e.g. a
-                # disk write failure) is recorded the same way a network
-                # failure is, instead of the old blanket suppress-and-ignore.
+                for data in response.iter_content(self.block_size):
+                    if self.stop_event.is_set():
+                        break
+                    if chunk_start_time + CHUNK_STALL_TIMEOUT < time.time():
+                        break
+                    chunk_start_time = time.time()
+                    buffer.write(data)
+                    self._report_progress(len(data), ctx)
+            except requests.exceptions.RequestException as exc:
+                # Network-level failure (connection error, read timeout,
+                # a chunked-encoding error mid-stream, etc.). Previously
+                # a bare ``contextlib.suppress(Exception)`` swallowed
+                # this entirely, so the only visible symptom was a
+                # coincidental "size mismatch" below with no indication
+                # of *why* the request actually failed.
                 self._mark_chunk_failed(
-                    range_meta, f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}"
+                    range_meta,
+                    f"request error via proxy {proxy_value or 'LOCAL'}: {exc}",
                 )
-            finally:
-                if added_to_active:
-                    with self._proxy_state_lock:
-                        self._active_proxy_indexes.discard(proxy_idx)
-                    self._notify_proxy_state()
+                return
+
+            chunk_bytes = len(buffer.getvalue())
+            if not math.isclose(chunk_bytes, expected_bytes, abs_tol=1):
+                self._report_progress(-chunk_bytes, ctx)
+                self._mark_chunk_failed(
+                    range_meta, f"size mismatch: got {chunk_bytes} expected {expected_bytes}"
+                )
                 if self.url_locks[thread_index].locked():
                     self.url_locks[thread_index].release()
-                if self.proxy_locks[proxy_idx].locked():
-                    self.proxy_locks[proxy_idx].release()
+                return
 
-        failed_chunk: Optional[tuple] = None
+            range_meta.pop("last_error", None)
+            tmp_filename.write_bytes(buffer.getvalue())
+            with self._working_proxy_lock:
+                is_newly_known = proxy_idx not in self.working_proxy_indexes
+                if is_newly_known:
+                    self.working_proxy_indexes.append(proxy_idx)
+            if is_newly_known:
+                self._notify_proxy_state()
+
+            range_meta["inUse"] = False
+            range_meta["downloaded"] = True
+
+            with self._progress_lock:
+                self._done_count += 1
+                done = self._done_count
+            if not ctx.progress_bar.disable:
+                ctx.progress_bar.desc = f"[{done}/{self._ranges_total}] Downloaded"
+            if self.progress_callback:
+                self.progress_callback(self._bytes_downloaded, self._total_bytes, done, self._ranges_total)
+        except Exception as exc:  # noqa: BLE001 - a chunk thread must never crash
+            # silently and leave range_meta["inUse"] stuck at True forever
+            # (the scheduling loop would then wait on this range forever).
+            # Anything unexpected past the request/streaming stage (e.g. a
+            # disk write failure) is recorded the same way a network
+            # failure is, instead of the old blanket suppress-and-ignore.
+            self._mark_chunk_failed(
+                range_meta, f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}"
+            )
+        finally:
+            if added_to_active:
+                with self._proxy_state_lock:
+                    self._active_proxy_indexes.discard(proxy_idx)
+                self._notify_proxy_state()
+            if self.url_locks[thread_index].locked():
+                self.url_locks[thread_index].release()
+            # proxy_idx is an int here: _acquire_proxy_lock() returning None
+            # returns out of the function before this try/finally is entered.
+            if self.proxy_locks[proxy_idx].locked():
+                self.proxy_locks[proxy_idx].release()
+
+    def _run_scheduling_loop(
+        self,
+        ranges: Dict[str, Dict[str, object]],
+        ctx: _DownloadContext,
+    ) -> Optional[FailedChunk]:
+        """Dispatch a download thread for each pending range until all are
+        done, cancelled, or one has permanently failed.
+
+        Returns a ``FailedChunk`` if a range exhausted its retry budget, or
+        ``None`` otherwise (both on full success and on cancellation -- the
+        caller distinguishes the latter by checking ``self.stop_event``
+        afterward).
+        """
+        failed_chunk: Optional[FailedChunk] = None
+        stop_scheduling = False
 
         try:
             while self._done_count < len(ranges):
-                if stop:
+                if stop_scheduling:
                     break
                 now = time.time()
                 for idx, meta in ranges.items():
                     if self.stop_event.is_set():
-                        stop = True
+                        stop_scheduling = True
                         break
                     if meta.get("failed"):
-                        failed_chunk = (idx, meta.get("last_error", "unknown error"), meta.get("attempts", 0))
-                        stop = True
+                        # _mark_chunk_failed always sets meta["attempts"] to
+                        # an int before "failed" is ever set, so int() below
+                        # is a plain (redundant at runtime) conversion, not a
+                        # type-unsafe assumption.
+                        failed_chunk = FailedChunk(
+                            chunk_idx=idx,
+                            last_error=str(meta.get("last_error", "unknown error")),
+                            attempt_count=int(meta["attempts"]),
+                        )
+                        stop_scheduling = True
                         break
                     if meta["inUse"] or meta["downloaded"]:
                         continue
@@ -599,37 +638,36 @@ class Downloader:
                         # source again immediately.
                         continue
 
-                    part_path = self.tmp_dir / f"{filename}.part{str(idx).zfill(len(str(split_count)))}"
+                    part_path = self.tmp_dir / f"{ctx.filename}.part{str(idx).zfill(len(str(ctx.split_count)))}"
                     if part_path.exists():
                         existing = part_path.read_bytes()
                         if math.isclose(len(existing), meta["bytes"], abs_tol=1):
                             if not meta["downloaded"]:
-                                report_progress(int(meta["bytes"]))
+                                self._report_progress(int(meta["bytes"]), ctx)
                                 meta["downloaded"] = True
                                 with self._progress_lock:
                                     self._done_count += 1
                                     done = self._done_count
-                                if not progress_bar.disable:
-                                    progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
+                                if not ctx.progress_bar.disable:
+                                    ctx.progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
                                 continue
                         else:
                             part_path.unlink()
 
-                    for thread_index in range(threads):
+                    for thread_index in range(ctx.threads):
                         if self.url_locks[thread_index].locked():
                             continue
                         self.url_locks[thread_index].acquire()
                         meta["inUse"] = True
                         threading.Thread(
-                            target=download_chunk,
-                            args=(idx, meta, thread_index),
+                            target=self._download_chunk,
+                            args=(idx, meta, thread_index, ctx),
                             daemon=True,
                         ).start()
                         break
                 time.sleep(0.05)
         except KeyboardInterrupt:
             self.cancel()
-            stop = True
         finally:
             for lock in self.url_locks:
                 if lock.locked():
@@ -638,24 +676,17 @@ class Downloader:
                 if lock.locked():
                     lock.release()
             self._notify_proxy_state()
-            progress_bar.close()
 
-        if failed_chunk is not None:
-            idx, reason, attempts = failed_chunk
-            raise ChunkDownloadFailed(
-                f"Chunk {idx} failed after {attempts} attempts (last error: {reason}). "
-                "The source IP and/or every proxy tried may be blocked or rate-limited."
-            )
+        return failed_chunk
 
-        if stop:
-            raise DownloadCancelled("Download cancelled")
-
+    def _merge_parts(self, ranges: Dict[str, Dict[str, object]], filename: str) -> Path:
         target_path = Path(filename)
         if target_path.exists():
             target_path.unlink()
 
+        split_count = len(ranges)
         with target_path.open("wb") as handle:
-            for idx in range(len(ranges)):
+            for idx in range(split_count):
                 part_path = self.tmp_dir / f"{filename}.part{str(idx).zfill(len(str(split_count)))}"
                 with part_path.open("rb") as chunk:
                     handle.write(chunk.read())
@@ -664,6 +695,59 @@ class Downloader:
         self.log(f"Finished writing {filename}")
         self.log(f"File Size: {human_readable_bytes(target_path.stat().st_size)}")
         return target_path
+
+    def _download_once(
+        self,
+        urls: Sequence[str],
+        filename: str,
+        threads: int,
+        bytes_per_split: int,
+    ) -> Path:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
+        }
+        total_size = self._fetch_total_size(urls[-1], headers)
+        self._total_bytes = total_size
+        self._bytes_downloaded = 0
+        self._done_count = 0
+
+        split_count = max(1, math.ceil(total_size / bytes_per_split))
+        ranges = self._build_ranges(total_size, split_count)
+        self._ranges_total = len(ranges)
+        self.url_locks = [threading.Lock() for _ in range(threads)]
+
+        ctx = _DownloadContext(
+            urls=urls,
+            filename=filename,
+            headers=headers,
+            threads=threads,
+            split_count=split_count,
+            progress_bar=tqdm(
+                desc=f"[0/{len(ranges)}] Downloaded",
+                total=total_size,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+                disable=not self.show_console_progress,
+            ),
+        )
+
+        try:
+            failed_chunk = self._run_scheduling_loop(ranges, ctx)
+        finally:
+            ctx.progress_bar.close()
+
+        if failed_chunk is not None:
+            raise ChunkDownloadFailed(
+                f"Chunk {failed_chunk.chunk_idx} failed after {failed_chunk.attempt_count} attempts "
+                f"(last error: {failed_chunk.last_error}). The source IP and/or every proxy tried may "
+                "be blocked or rate-limited."
+            )
+
+        if self.stop_event.is_set():
+            raise DownloadCancelled("Download cancelled")
+
+        return self._merge_parts(ranges, filename)
 
     @staticmethod
     def _build_ranges(total_value: int, split_count: int) -> Dict[str, Dict[str, object]]:

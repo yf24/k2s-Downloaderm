@@ -46,7 +46,6 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
         self._current_active: list[str] = []
         self._current_available_raw: list[str | None] = []
         self._collapsed_height: int | None = None
-        self._collapsed_height: int | None = None
         self._pending_progress: tuple[int, int, int, int] | None = None
         self._log_buffer: list[str] = []
         self._ui_refresh_interval_ms = 120
@@ -297,8 +296,6 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
         root.addWidget(self.captcha_group)
         self._collapsed_height = self.sizeHint().height()
 
-        self._collapsed_height = self.sizeHint().height()
-
     def _start_proxy_loader(self, refresh: bool) -> None:
         if self._proxy_loader:
             return
@@ -336,7 +333,7 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
 
     def _toggle_dev_panel(self, state: bool) -> None:
         if state:
-            self._collapsed_height = self.size().height()# 儲存展開前的高度
+            self._collapsed_height = self.size().height()  # remember pre-expand height
             self.dev_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             self.dev_group.setMaximumHeight(16777215)
             self.dev_group.updateGeometry()
@@ -349,7 +346,7 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
             self.dev_group.setVisible(state)
             self.dev_group.updateGeometry()
             if self._collapsed_height is not None:
-                self.setMinimumHeight(0)           # 解除可能留下的 min height 限制
+                self.setMinimumHeight(0)  # clear any leftover min-height constraint
                 self.resize(self.width(), self._collapsed_height)
             self.dev_toggle.setArrowType(Qt.ArrowType.RightArrow)
 
