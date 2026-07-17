@@ -337,19 +337,27 @@ class Downloader:
         otherwise-successful chunk, so it only logs and moves on.
         """
         manifest_path = self._manifest_path(ctx.filename)
-        payload = {
-            "file_id": ctx.file_id,
-            "total_size": ctx.total_size,
-            "split_size": ctx.bytes_per_split,
-            "split_count": len(ctx.ranges),
-            "ranges": {
+        # Snapshot every range's flags under _progress_lock -- the same lock
+        # _download_chunk's completion path and the scheduling loop's
+        # part-reuse branch hold while flipping "downloaded" -- so this
+        # dict comprehension can't observe some ranges mid-update and
+        # others not (in-memory only, no I/O happens while the lock is
+        # held).
+        with self._progress_lock:
+            ranges_snapshot = {
                 idx: {
                     "range": meta["range"],
                     "bytes": meta["bytes"],
                     "downloaded": bool(meta.get("downloaded")),
                 }
                 for idx, meta in ctx.ranges.items()
-            },
+            }
+        payload = {
+            "file_id": ctx.file_id,
+            "total_size": ctx.total_size,
+            "split_size": ctx.bytes_per_split,
+            "split_count": len(ctx.ranges),
+            "ranges": ranges_snapshot,
             "updated_at": time.time(),
         }
         tmp_manifest_path = manifest_path.with_name(manifest_path.name + ".tmp")
@@ -438,8 +446,17 @@ class Downloader:
         if not self.tmp_dir.exists():
             return False
         basename = Path(filename).name
+        # Match only this app's own part-file naming (".partN" / ".partN.tmp",
+        # any digit width -- a stale set from a different split layout can
+        # be padded to a different width than the current run's) rather
+        # than a bare "*" glob, since this loop deletes what it matches and
+        # a wildcard suffix would also sweep up anything else that merely
+        # starts with the same prefix.
+        part_name_pattern = re.compile(rf"^{re.escape(basename)}\.part\d+(?:\.tmp)?$")
         removed = False
-        for stale_path in self.tmp_dir.glob(f"{basename}.part*"):
+        for stale_path in self.tmp_dir.iterdir():
+            if not part_name_pattern.match(stale_path.name):
+                continue
             try:
                 stale_path.unlink()
                 removed = True
