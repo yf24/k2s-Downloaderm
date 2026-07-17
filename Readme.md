@@ -63,3 +63,8 @@ uv run pytest -q           # run the test suite
 uv run ruff check .        # lint
 ```
 Both checks also run automatically in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing conventions, and the commit-message format used in this repo.
+
+## Documentation
+This file covers install/usage. Deeper docs are split by audience and live under `docs/`:
+- Human-facing, Traditional Chinese: [`docs/human/architecture.md`](docs/human/architecture.md) (module map, control flow, threading model) and [`docs/human/requirements.md`](docs/human/requirements.md) (full REQ/AC spec).
+- AI-agent-facing, English canonical versions plus the project's living backlog: [`docs/ai/`](docs/ai/). AI agents/coder agents working on this repo should start at [`AGENTS.md`](AGENTS.md) instead of this file.
