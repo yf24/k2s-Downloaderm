@@ -214,6 +214,11 @@ class Downloader:
         self,
         *,
         tmp_dir: Path | str = "tmp",
+        # Debug/inspection artifact only: download() unconditionally deletes
+        # this file at the start of every run and never reads it back (the
+        # generated URLs expire quickly, so cross-run reuse has little
+        # value) -- it exists purely so the last batch of generated
+        # download URLs for a given file_id is visible on disk afterward.
         url_cache_path: Path | str = "urls.json",
         proxy_cache_path: Path | str = "proxies.txt",
         block_size: int = 32 * 1024,
@@ -638,16 +643,6 @@ class Downloader:
 
         return result
 
-    def _load_cached_urls(self, file_id: str) -> List[str]:
-        if not self.url_cache_path.exists():
-            return []
-        try:
-            with self.url_cache_path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            return data.get(file_id, [])
-        except Exception:
-            return []
-
     def _cache_urls(self, file_id: str, urls: Sequence[str]) -> None:
         if self.url_cache_path.exists():
             try:
@@ -674,6 +669,20 @@ class Downloader:
             raise RuntimeError(
                 f"Could not reach the download host to determine file size (possibly blocked): {exc}"
             ) from exc
+
+        if not head_response.ok:
+            # A non-2xx status here (403/429/5xx, ...) usually means this
+            # download URL has expired or is blocked -- the Content-Length
+            # on an error page describes that error page, not the actual
+            # file. Reading it anyway would build every chunk's byte range
+            # from the wrong total size, so every chunk would then fail
+            # with a "size mismatch" that doesn't point at the real cause,
+            # burning a full retry cycle before the download gives up.
+            raise RuntimeError(
+                f"Could not determine file size: HEAD request returned "
+                f"HTTP {head_response.status_code}. The download URL may have "
+                "expired or be blocked."
+            )
 
         size_in_bytes = head_response.headers.get("Content-Length")
         if not size_in_bytes:

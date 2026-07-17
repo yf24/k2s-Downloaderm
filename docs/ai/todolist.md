@@ -56,7 +56,7 @@
   - 建議做法：part 檔一律只用 `Path(filename).name` 命名；最終輸出前確認/建立目標父目錄。
   - 測試：`filename` 含相對路徑時 part 檔落在 `tmp/` 平面、最終檔寫到指定路徑。
 
-- [ ] **R2-6 `_fetch_total_size` 不檢查 HTTP status → 錯誤頁的 Content-Length 被當成檔案大小**
+- [x] **R2-6 `_fetch_total_size` 不檢查 HTTP status → 錯誤頁的 Content-Length 被當成檔案大小**（2026-07-17 完成；測試：`tests/test_downloader_timeouts.py::TestSizeDiscoveryRejectsNonSuccessStatus`。實作：HEAD 回應非 2xx（`not head_response.ok`）時立即丟 `RuntimeError`（訊息含 status code 與「download URL 可能已過期或被封鎖」提示），不再讀取錯誤頁的 `Content-Length`。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_fetch_total_size`）
   - 問題：HEAD 回 403/429/5xx 時仍讀 `Content-Length`（錯誤頁大小），切出完全錯誤的 ranges，之後每個 chunk 都 size mismatch，浪費整輪重試才失敗，且訊息不指向真正原因（URL 過期/被封鎖）。
   - 建議做法：非 2xx 直接丟 `RuntimeError`（訊息含 status code 與「download URL 可能已過期或被封鎖」提示）。
@@ -70,7 +70,7 @@
   - 建議做法：chunk 改為邊下邊寫暫存檔（`.partNN.tmp` 完成後 rename 成 `.partNN`，rename 的原子性同時消除「寫一半的 part 被重用分支誤判完整」的風險）；`_merge_parts` 改 `shutil.copyfileobj` 串流合併。
   - 測試：驗證 rename 前的 `.tmp` 不會被排程重用分支撿走；合併結果 byte-identical。
 
-- [ ] **R2-8 死碼 `_load_cached_urls`**
+- [x] **R2-8 死碼 `_load_cached_urls`**（2026-07-17 完成。實作：直接刪除該 method（確認全 repo 無呼叫端）；`url_cache_path` 建構參數旁補上 docstring 說明其僅為除錯／檢視用途（`download()` 每次執行都會先刪除舊檔、只寫入不讀回）。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_load_cached_urls`，全 repo 無呼叫端也無測試）
   - 問題：`download()` 開頭固定刪除 URL cache 檔再重建，`_load_cached_urls` 從未被呼叫 —— 「URL 快取重用」這個功能只做了寫入端。download URL 本身有時效，跨 session 重用價值本來就低。
   - 建議做法：直接刪除該 method（連同評估 `url_cache_path`/`urls.json` 是否還有存在必要 —— 若只剩除錯用途，在 docstring 註明）。
@@ -168,7 +168,7 @@
 > 第一輪（P0 ~ P5）的處理順序與完成紀錄已隨該輪一併封存，見
 > [`todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md) 的「完成紀錄」段落。
 
-第二輪（R2-1 ~ R2-13）：R2-1~R2-5、R2-7、R2-13 已完成（見各項狀態與 PR 連結）；R2-6、R2-8 ~ R2-12 仍未認領。
+第二輪（R2-1 ~ R2-13）：R2-1~R2-8、R2-13 已完成（見各項狀態與 PR 連結）；R2-9 ~ R2-12 仍未認領。
 建議接手順序：R2-P0（並發 race，改動小、風險高）→ R2-4/R2-5（Windows 相容性，是 exe 打包的前置）
 → **R2-7＋R2-13（串流寫入＋斷點續傳，使用者明確需求，兩項綁定實作）** → R2-9（打包，含 R2-9.1
 使用者資料目錄，與 R2-13 的 tmp 位置一起規劃）→ 其餘依需求。R2-11 的 telemetry 是 R2-10（proxy
