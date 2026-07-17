@@ -78,6 +78,8 @@ CLI/GUI
 
 安全性立場（另見 [Readme.md](../../Readme.md) 的「Security Note: Public Proxies」段落）：proxy 這段連線本身即使目標網址是 HTTPS，也是未經驗證的明文 HTTP（`requests` 是透過 HTTP `CONNECT` 把 HTTPS 隧道到這個 proxy），因此惡意的 proxy 操作者有能力觀察或竄改經過的流量。這是為了規避單一 IP 速率限制而刻意做的取捨並已明確記載，不是疏忽 — 直連永遠優先（見第 3 節），proxy pool 純粹是 fallback。
 
+**吞吐量 telemetry**（見 [`todolist.md`](todolist.md) R2-11）：`_report_progress` 可選地從 `_download_chunk` 接收 `is_direct: bool`（`proxy_idx == 0`），把即時連線下載到的位元組記到 `_direct_bytes_downloaded` 或 `_proxy_bytes_downloaded`；未經即時連線取得的位元組（排程迴圈的 part 重用分支，接續已在磁碟上的區段）則傳入 `is_direct=None`，不計入這個統計。`_run_scheduling_loop` 每次 poll 都會呼叫 `_maybe_report_throughput()`，最多每 `TELEMETRY_REPORT_INTERVAL`（5 秒）透過 `status_callback` 回報一次訊息（聚合速度、直連／proxy 百分比、活躍連線數）。這是為了讓實際使用能驗證或推翻「本專案的速度上限是 per-connection 而非 per-IP」這個工作假設而存在——這份 instrumentation 本身不做任何決定，R2-10／R2-12 的 proxy 投資與尾端崩落對策仍需要真實觀測數據。
+
 ## 5. 錯誤分類
 
 | 例外 | 何時丟出 | 對呼叫端的意義 |

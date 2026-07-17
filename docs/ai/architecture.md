@@ -78,6 +78,8 @@ The previous implementation scanned for a proxy lock reporting `locked() == Fals
 
 Security posture (see also [Readme.md](../../Readme.md)'s "Security Note: Public Proxies" section): the proxy hop itself is unauthenticated plain HTTP even when the target URL is HTTPS (`requests` tunnels HTTPS through an HTTP `CONNECT` to the proxy), so a malicious proxy operator is positioned to observe or tamper with routed traffic. This is a deliberate, documented tradeoff for working around per-IP rate limits, not an oversight — direct connection is always preferred (§ 3) and the proxy pool is purely a fallback.
 
+**Throughput telemetry** (see [`todolist.md`](todolist.md) R2-11): `_report_progress` optionally takes `is_direct: bool` from `_download_chunk` (`proxy_idx == 0`), crediting live-connection bytes to `_direct_bytes_downloaded` or `_proxy_bytes_downloaded`; bytes credited without a live connection this run (the scheduling loop's part-reuse branch resuming an already-on-disk part) pass `is_direct=None` and are excluded from that split. `_run_scheduling_loop` polls `_maybe_report_throughput()` every tick, which emits a `status_callback` message (aggregate speed, direct/proxy percentage split, active connection count) at most once per `TELEMETRY_REPORT_INTERVAL` (5s). This exists to let real usage validate or refute the working hypothesis that this project's speed limit is per-connection rather than per-IP — the instrumentation alone doesn't decide anything; R2-10/R2-12's proxy-investment and tail-collapse decisions still need real observed data.
+
 ## 5. Error Taxonomy
 
 | Exception | Raised when | Caller-visible meaning |

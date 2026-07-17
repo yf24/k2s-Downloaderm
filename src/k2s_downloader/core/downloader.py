@@ -91,6 +91,12 @@ CHUNK_STALL_TIMEOUT = 20
 # socket-level connect/read timeout fires; threads in the streaming loop or
 # in `_acquire_proxy_lock` exit within a block read / 0.02s.
 CHUNK_THREADS_JOIN_TIMEOUT = 30.0
+# R2-11: minimum real-time gap (seconds) between throughput telemetry status
+# messages during a download. Checked every scheduling-loop poll tick (every
+# ~0.05s) but only actually emits a message once this many seconds have
+# elapsed, so it doesn't flood status_callback (and, via it, the CLI/GUI log)
+# with a line every tick.
+TELEMETRY_REPORT_INTERVAL = 5.0
 
 
 @dataclass(frozen=True)
@@ -249,6 +255,18 @@ class Downloader:
         self._total_bytes = 0
         self._ranges_total = 0
         self._done_count = 0
+        # R2-11 throughput telemetry: bytes actually pulled over a live
+        # connection this download, split by connection type (direct vs.
+        # any proxy). Deliberately excludes bytes credited via the
+        # scheduling loop's part-reuse branch (resumed/already-on-disk
+        # chunks never touched a live connection this run, so counting
+        # them here would inflate the measured throughput).
+        self._direct_bytes_downloaded = 0
+        self._proxy_bytes_downloaded = 0
+        self._telemetry_last_emit_time = 0.0
+        self._telemetry_last_bytes = 0
+        self._telemetry_last_direct_bytes = 0
+        self._telemetry_last_proxy_bytes = 0
 
         self.proxies: List[Optional[str]] = []
         self.proxy_locks: List[threading.Lock] = []
@@ -693,17 +711,68 @@ class Downloader:
             total_size = total_size + 2**32
         return total_size
 
-    def _report_progress(self, delta: int, ctx: _DownloadContext) -> None:
+    def _report_progress(
+        self, delta: int, ctx: _DownloadContext, *, is_direct: Optional[bool] = None
+    ) -> None:
         if delta == 0:
             return
         with self._progress_lock:
             self._bytes_downloaded += delta
             downloaded = self._bytes_downloaded
             done = self._done_count
+            # is_direct is None for bytes credited without a live connection
+            # this run (the scheduling loop's part-reuse branch crediting an
+            # already-on-disk part) -- those must not count toward
+            # direct/proxy throughput telemetry, which only means to measure
+            # this run's actual network activity.
+            if is_direct is True:
+                self._direct_bytes_downloaded += delta
+            elif is_direct is False:
+                self._proxy_bytes_downloaded += delta
         if self.progress_callback:
             self.progress_callback(downloaded, self._total_bytes, done, self._ranges_total)
         if not ctx.progress_bar.disable:
             ctx.progress_bar.update(delta)
+
+    def _maybe_report_throughput(self) -> None:
+        """R2-11: periodically log aggregate throughput and its direct-vs-proxy
+        split, so real usage can validate (or refute) the working hypothesis
+        that this project's speed limit is per-connection rather than
+        per-IP (see docs/ai/todolist.md R2-11) -- without this, there is no
+        way to observe that split short of external packet capture.
+        """
+        now = time.time()
+        with self._progress_lock:
+            elapsed = now - self._telemetry_last_emit_time
+            if elapsed < TELEMETRY_REPORT_INTERVAL:
+                return
+            interval_bytes = self._bytes_downloaded - self._telemetry_last_bytes
+            interval_direct = self._direct_bytes_downloaded - self._telemetry_last_direct_bytes
+            interval_proxy = self._proxy_bytes_downloaded - self._telemetry_last_proxy_bytes
+            self._telemetry_last_emit_time = now
+            self._telemetry_last_bytes = self._bytes_downloaded
+            self._telemetry_last_direct_bytes = self._direct_bytes_downloaded
+            self._telemetry_last_proxy_bytes = self._proxy_bytes_downloaded
+
+        if interval_bytes <= 0:
+            return
+
+        live_bytes = interval_direct + interval_proxy
+        if live_bytes > 0:
+            direct_pct = 100.0 * interval_direct / live_bytes
+            proxy_pct = 100.0 * interval_proxy / live_bytes
+            split_text = f"direct: {direct_pct:.0f}%, proxy: {proxy_pct:.0f}%"
+        else:
+            # Every byte this interval came from the part-reuse branch
+            # (resumed chunks), not a live connection -- nothing to split.
+            split_text = "no live connection activity (resumed chunks only)"
+
+        speed = interval_bytes / elapsed
+        active = len(self._active_proxy_indexes)
+        self.log(
+            f"Throughput: {human_readable_bytes(speed)}/s over the last {elapsed:.0f}s "
+            f"({split_text}; {active} active connection(s))."
+        )
 
     def _download_chunk(
         self,
@@ -804,7 +873,7 @@ class Downloader:
                         # the whole point of streaming to disk incrementally.
                         part_file.flush()
                         bytes_written += len(data)
-                        self._report_progress(len(data), ctx)
+                        self._report_progress(len(data), ctx, is_direct=proxy_idx == 0)
             except requests.exceptions.RequestException as exc:
                 # Network-level failure (connection error, read timeout,
                 # a chunked-encoding error mid-stream, etc.). Previously
@@ -820,7 +889,7 @@ class Downloader:
                 return
 
             if not math.isclose(bytes_written, expected_bytes, abs_tol=1):
-                self._report_progress(-bytes_written, ctx)
+                self._report_progress(-bytes_written, ctx, is_direct=proxy_idx == 0)
                 tmp_write_path.unlink(missing_ok=True)
                 self._mark_chunk_failed(
                     range_meta, f"size mismatch: got {bytes_written} expected {expected_bytes}"
@@ -972,6 +1041,7 @@ class Downloader:
                         chunk_threads.append(chunk_thread)
                         chunk_thread.start()
                         break
+                self._maybe_report_throughput()
                 time.sleep(0.05)
         except KeyboardInterrupt:
             self.cancel()
@@ -1054,6 +1124,12 @@ class Downloader:
         self._total_bytes = total_size
         self._bytes_downloaded = 0
         self._done_count = 0
+        self._direct_bytes_downloaded = 0
+        self._proxy_bytes_downloaded = 0
+        self._telemetry_last_emit_time = time.time()
+        self._telemetry_last_bytes = 0
+        self._telemetry_last_direct_bytes = 0
+        self._telemetry_last_proxy_bytes = 0
 
         split_count = max(1, math.ceil(total_size / bytes_per_split))
         ranges = self._build_ranges(total_size, split_count)
@@ -1101,7 +1177,8 @@ class Downloader:
             raise ChunkDownloadFailed(
                 f"Chunk {failed_chunk.chunk_idx} failed after {failed_chunk.attempt_count} attempts "
                 f"(last error: {failed_chunk.last_error}). The source IP and/or every proxy tried may "
-                "be blocked or rate-limited."
+                "be blocked or rate-limited. If you're on a dynamic IP, restarting your router/modem "
+                "to get a new one may help."
             )
 
         if self.stop_event.is_set():

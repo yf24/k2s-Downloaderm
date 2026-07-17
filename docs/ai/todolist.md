@@ -97,7 +97,11 @@
 
 ## R2-P5 — 根本目的（突破 50KB/s）達成度檢視
 
-- [ ] **R2-11 用量測數據驗證加速機制、據此決定 proxy 架構去留**
+- [~] **R2-11 用量測數據驗證加速機制、據此決定 proxy 架構去留**（2026-07-17 部分完成，分支 `feature/r2-11-throughput-telemetry-and-blocked-hint`——只做了「建議做法」第 1、3 點，第 2 點需要真實使用數據才能做決定，本環境無法連 Keep2Share 蒐集，留待有真實數據時再處理）
+  - 已完成（第 1 點，telemetry）：`_report_progress` 新增 `is_direct: Optional[bool]` 參數，由 `_download_chunk` 依 `proxy_idx == 0` 傳入，分別累計 `_direct_bytes_downloaded`／`_proxy_bytes_downloaded`（排程重用分支接續已在磁碟上的區段時傳 `is_direct=None`，不計入這個統計，避免非即時連線的位元組污染量測）。新增 `_maybe_report_throughput()`，由 `_run_scheduling_loop` 每個 poll tick 呼叫，最多每 `TELEMETRY_REPORT_INTERVAL`（5 秒）透過既有 `status_callback` 回報一次「聚合速度／直連-proxy 百分比／活躍連線數」（CLI 印出、GUI log 面板本就會顯示，`core/` 未新增 print/logging）。測試：`tests/test_downloader_throughput_telemetry.py`（10 個，對修正前程式碼全部 fail）。
+  - 已完成（第 3 點，零成本提示）：`ChunkDownloadFailed` 與 `k2s_client.py` 「所有 proxy 都被封鎖」的 `RuntimeError` 訊息都補上「若為動態 IP，可嘗試重啟數據機換 IP 後重試」的提示。
+  - **未完成、暫緩**：第 2 點「依數據調整預設」需要真實 telemetry 數據才能決定（例如是否該把 proxy 改成 opt-in）——這正是本項的核心驗證/決策目的，但本環境無法連 Keep2Share 產生真實下載流量，只能等使用者用這次新增的 telemetry 實際跑過幾次大檔下載、觀察 log 訊息後再回來決定。第 4 點（aria2c 匯出）標記「選配」，未實作。
+  - 文件：`docs/ai/architecture.md`／`docs/human/architecture.md` §4 補充 telemetry 設計說明。
   - **現況評估**：對照根本目的（瀏覽器免費下載被限 50KB/s），加速機制在程式碼層面已完整 —— 單次 captcha → 產生 N 個 download token → byte-range 並行下載 → 直連優先＋proxy fallback＋重試/backoff＋取消＋CLI/GUI 雙前端，且第一輪 P0~P5 已把掛死/損毀類缺陷清完。**「紙面上」目的已達成，但缺實測數據佐證**（本輪環境無法連 Keep2Share 驗證）。
   - **已知事實（2026-07-17 使用者第一手經驗；除最後一點外皆為本 app 實際使用觀察）**：
     - website（free plan）下載被限 50KB/s，且 browser 下載非常容易中斷（原因不明）—— 這兩點是本 app 存在的原始動機。
@@ -168,12 +172,13 @@
 > 第一輪（P0 ~ P5）的處理順序與完成紀錄已隨該輪一併封存，見
 > [`todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md) 的「完成紀錄」段落。
 
-第二輪（R2-1 ~ R2-13）：R2-1~R2-8、R2-13 已完成（見各項狀態與 PR 連結）；R2-9 ~ R2-12 仍未認領。
+第二輪（R2-1 ~ R2-13）：R2-1~R2-8、R2-13 已完成；R2-11 部分完成（telemetry 與零成本提示已做，「依數據
+調整預設」需要真實使用數據才能決定，留待之後）（見各項狀態與 PR 連結）。R2-9、R2-10、R2-12 仍未認領。
 建議接手順序：R2-P0（並發 race，改動小、風險高）→ R2-4/R2-5（Windows 相容性，是 exe 打包的前置）
 → **R2-7＋R2-13（串流寫入＋斷點續傳，使用者明確需求，兩項綁定實作）** → R2-9（打包，含 R2-9.1
-使用者資料目錄，與 R2-13 的 tmp 位置一起規劃）→ 其餘依需求。R2-11 的 telemetry 是 R2-10（proxy
-投資深度）與 R2-12（99% 尾端崩落對策選擇）共同的前置驗證，三項建議一起規劃；R2-12 的對策 4
-（縮小尾端 split）零架構改動可先行。
+使用者資料目錄，與 R2-13 的 tmp 位置一起規劃）→ 其餘依需求。R2-10（proxy 投資深度）與 R2-12（99% 尾端
+崩落對策選擇）建議等 R2-11 的 telemetry 累積到真實使用數據後再決定；R2-12 的對策 4（縮小尾端 split）
+零架構改動可先行，不需要等數據。
 
 **R2-P6（R2-14、R2-15）** 是 2026-07-17 使用者直接提出的兩項流程／文件維護改善（review 留言截斷問題、
 todolist 歸檔機制），與上述 R2-1~R2-13 的程式碼修正屬不同性質；兩項皆已完成（見各項狀態）。本檔（含

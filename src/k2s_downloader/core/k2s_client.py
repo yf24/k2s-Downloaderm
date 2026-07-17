@@ -279,8 +279,9 @@ def generate_download_urls(
     if not urls:
         raise RuntimeError(
             "No working download URLs could be generated. Your IP and every proxy tried appear "
-            "to be blocked or rate-limited by Keep2Share. Try refreshing the proxy list or "
-            "waiting a while before retrying."
+            "to be blocked or rate-limited by Keep2Share. Try refreshing the proxy list, waiting "
+            "a while before retrying, or -- if you're on a dynamic IP -- restarting your router/modem "
+            "to get a new one."
         )
 
     if len(urls) < count:
