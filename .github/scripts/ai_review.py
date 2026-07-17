@@ -41,6 +41,12 @@ def build_review_prompt(diff_text: str) -> str:
 1. 是否有邏輯漏洞或潛在的 Bug？
 2. 程式碼效能與可讀性是否有優化空間？
 3. 是否符合 Python 的最佳實踐 (PEP 8)？
+
+當你進行 Review 時，請將問題分類為 `[Critical/Bug]`（嚴重錯誤/漏洞）、`[Improvement]`（建議優化）與 `[Nitpick]`（挑剔/細節美化）。
+
+* 如果只有 `Nitpick` 等級的問題，請直接給予 Approve，不要要求 Coder 重新修改。
+* 只有在偵測到 `Critical` 或嚴重的 `Improvement` 時，才要求重新修改。
+
 如果是優秀的修改，請給予肯定。如果有需要改進的地方，請具體指出並給出修改建議程式碼。
 以下是程式碼變動：
 {diff_text}
