@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence
 
 import requests
 from shutil import which
@@ -74,6 +74,14 @@ class _DownloadContext:
     threads: int
     split_count: int
     progress_bar: tqdm
+
+
+class FailedChunk(NamedTuple):
+    """A chunk that exhausted its retry budget in ``_run_scheduling_loop``."""
+
+    chunk_idx: str
+    last_error: str
+    attempt_count: int
 
 
 class DownloadCancelled(RuntimeError):
@@ -470,9 +478,10 @@ class Downloader:
         buffer = io.BytesIO()
 
         added_to_active = False
-        proxy_idx = self._acquire_proxy_lock()
-        if proxy_idx is None:
+        proxy_idx_or_none = self._acquire_proxy_lock()
+        if proxy_idx_or_none is None:
             return
+        proxy_idx: int = proxy_idx_or_none
 
         proxy_value = self.proxies[proxy_idx]
         # NOTE: the proxy connection itself is unauthenticated plain
@@ -588,16 +597,16 @@ class Downloader:
         self,
         ranges: Dict[str, Dict[str, object]],
         ctx: _DownloadContext,
-    ) -> Optional[Tuple[str, str, int]]:
+    ) -> Optional[FailedChunk]:
         """Dispatch a download thread for each pending range until all are
         done, cancelled, or one has permanently failed.
 
-        Returns a ``(chunk_idx, last_error_reason, attempt_count)`` tuple if
-        a range exhausted its retry budget, or ``None`` otherwise (both on
-        full success and on cancellation -- the caller distinguishes the
-        latter by checking ``self.stop_event`` afterward).
+        Returns a ``FailedChunk`` if a range exhausted its retry budget, or
+        ``None`` otherwise (both on full success and on cancellation -- the
+        caller distinguishes the latter by checking ``self.stop_event``
+        afterward).
         """
-        failed_chunk: Optional[Tuple[str, str, int]] = None
+        failed_chunk: Optional[FailedChunk] = None
         stop_scheduling = False
 
         try:
@@ -614,10 +623,10 @@ class Downloader:
                         # an int before "failed" is ever set, so int() below
                         # is a plain (redundant at runtime) conversion, not a
                         # type-unsafe assumption.
-                        failed_chunk = (
-                            idx,
-                            str(meta.get("last_error", "unknown error")),
-                            int(meta["attempts"]),
+                        failed_chunk = FailedChunk(
+                            chunk_idx=idx,
+                            last_error=str(meta.get("last_error", "unknown error")),
+                            attempt_count=int(meta["attempts"]),
                         )
                         stop_scheduling = True
                         break
@@ -670,13 +679,14 @@ class Downloader:
 
         return failed_chunk
 
-    def _merge_parts(self, ranges: Dict[str, Dict[str, object]], filename: str, split_count: int) -> Path:
+    def _merge_parts(self, ranges: Dict[str, Dict[str, object]], filename: str) -> Path:
         target_path = Path(filename)
         if target_path.exists():
             target_path.unlink()
 
+        split_count = len(ranges)
         with target_path.open("wb") as handle:
-            for idx in range(len(ranges)):
+            for idx in range(split_count):
                 part_path = self.tmp_dir / f"{filename}.part{str(idx).zfill(len(str(split_count)))}"
                 with part_path.open("rb") as chunk:
                     handle.write(chunk.read())
@@ -728,16 +738,16 @@ class Downloader:
             ctx.progress_bar.close()
 
         if failed_chunk is not None:
-            idx, reason, attempts = failed_chunk
             raise ChunkDownloadFailed(
-                f"Chunk {idx} failed after {attempts} attempts (last error: {reason}). "
-                "The source IP and/or every proxy tried may be blocked or rate-limited."
+                f"Chunk {failed_chunk.chunk_idx} failed after {failed_chunk.attempt_count} attempts "
+                f"(last error: {failed_chunk.last_error}). The source IP and/or every proxy tried may "
+                "be blocked or rate-limited."
             )
 
         if self.stop_event.is_set():
             raise DownloadCancelled("Download cancelled")
 
-        return self._merge_parts(ranges, filename, split_count)
+        return self._merge_parts(ranges, filename)
 
     @staticmethod
     def _build_ranges(total_value: int, split_count: int) -> Dict[str, Dict[str, object]]:
