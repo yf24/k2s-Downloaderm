@@ -19,7 +19,38 @@ import pytest
 import requests
 
 from k2s_downloader.core import downloader as downloader_module
-from k2s_downloader.core.downloader import ChunkDownloadFailed, Downloader
+from k2s_downloader.core.downloader import ChunkDownloadFailed, Downloader, _truncate_error_message
+
+
+class TestTruncateErrorMessage:
+    def test_long_query_string_is_truncated(self):
+        url_tail = "?temp_url_sig=" + "a" * 200 + "&client_ip=1.2.3.4"
+        message = f"HTTPSConnectionPool(host='example.com', port=443): Max retries exceeded with url: /f{url_tail} (Caused by ...)"
+        result = _truncate_error_message(message)
+        assert "temp_url_sig" not in result
+        assert "?<truncated>" in result
+        # The parts before/after the query string (proxy/exception context) survive.
+        assert result.startswith("HTTPSConnectionPool(host='example.com', port=443)")
+        assert result.endswith("(Caused by ...)")
+
+    def test_short_query_string_is_left_alone(self):
+        message = "some error ?a=1 happened"
+        assert _truncate_error_message(message) == message
+
+    def test_message_without_a_query_string_is_unchanged(self):
+        message = "Connection to 1.2.3.4 timed out. (connect timeout=20)"
+        assert _truncate_error_message(message) == message
+
+    def test_mark_chunk_failed_truncates_reason_before_logging_and_storing(self, tmp_path):
+        log: list[str] = []
+        downloader = Downloader(tmp_dir=tmp_path / "tmp", status_callback=log.append)
+        range_meta: dict[str, object] = {}
+        long_reason = "request error via proxy 1.2.3.4:8080: url: /f?sig=" + "b" * 100
+
+        downloader._mark_chunk_failed(range_meta, long_reason)
+
+        assert "b" * 100 not in log[-1]
+        assert "b" * 100 not in range_meta["last_error"]
 
 
 class TestChunkExceptionHandling:

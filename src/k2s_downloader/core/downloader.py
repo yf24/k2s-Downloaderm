@@ -71,6 +71,22 @@ def _sanitize_filename_component(name: str) -> str:
         sanitized = f"_{sanitized}"
     return sanitized or "download"
 
+
+# Matches a `?query=string` of meaningful length embedded in a chunk-failure
+# message. `requests`/`urllib3` exceptions embed the full request URL,
+# including Keep2Share's signed download URL (temp_url_sig, client_ip,
+# per-user tags, ...) -- adds no diagnostic value beyond what the proxy
+# address and exception type already say, and with up to 20 threads x 8
+# retries floods the log with near-identical multi-hundred-character walls
+# of text. Only long query strings are touched so short, meaningful ones
+# (e.g. a plain "?" in prose) aren't clobbered.
+_LONG_QUERY_STRING_RE = re.compile(r"\?[^\s)]{40,}")
+
+
+def _truncate_error_message(message: str) -> str:
+    return _LONG_QUERY_STRING_RE.sub("?<truncated>", message)
+
+
 # Timeout (seconds) for the HEAD request used to discover total file size.
 # Previously unset, so a blocked/unresponsive IP would hang here forever.
 HEAD_REQUEST_TIMEOUT = 15
@@ -513,6 +529,7 @@ class Downloader:
         ``_download_once`` can stop and raise ``ChunkDownloadFailed`` instead
         of retrying forever.
         """
+        reason = _truncate_error_message(reason)
         attempts = int(range_meta.get("attempts", 0)) + 1
         range_meta["attempts"] = attempts
         range_meta["last_error"] = reason
