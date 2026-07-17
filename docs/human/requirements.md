@@ -53,9 +53,10 @@
 ### REQ-6：區塊下載的可選 proxy pool
 - **AC-6.1**：`Downloader.refresh_proxies()` 產生的 proxy 清單第一個元素恆為 `None`（代表「直連，不用 proxy」）；這個不變量在其他地方會被依賴（見 AC-6.2），且由 `get_working_proxies()` 的每一條回傳路徑保證成立。
 - **AC-6.2**：為區塊選擇連線方式時，只要直連的槽位是空的就一律優先嘗試；只有在直連槽位忙碌／不可用時才會改用第三方 proxy。
-- **AC-6.3**：Proxy 候選清單來自公開、未經驗證的第三方來源（proxyscrape.com），僅做輕量驗證（對 `api.myip.com` 做一次可達性測試）；這一點會明確告知使用者屬於 MITM 風險（proxy 這段連線本身是未經驗證的明文 HTTP，即使目標網址是 HTTPS），而非當成可信賴的通道。
-- **AC-6.4**：Proxy 候選清單的快取路徑可設定（`Downloader(proxy_cache_path=...)` / `get_working_proxies(cache_path=...)`），預設為目前工作目錄下的 `proxies.txt` 以維持向後相容；寫入尚不存在的巢狀路徑時會自動建立父目錄。
+- **AC-6.3**：Proxy 候選清單來自多個公開、未經驗證的第三方來源（proxyscrape.com 加上數個 GitHub 上的 raw 清單），合併去重後任一來源掛掉都不會讓整個 pool 清空；每個候選都會對真正的下載目標發出 HTTPS `HEAD` 請求做驗證（而非泛用可達性測試），非 2xx/3xx 回應視為驗證失敗。這一點會明確告知使用者屬於 MITM 風險（proxy 這段連線本身是未經驗證的明文 HTTP，即使目標網址是 HTTPS），而非當成可信賴的通道。
+- **AC-6.4**：Proxy 候選清單的快取路徑可設定（`Downloader(proxy_cache_path=...)` / `get_working_proxies(cache_path=...)`），預設為目前工作目錄下的 `proxies.txt` 以維持向後相容；寫入尚不存在的巢狀路徑時會自動建立父目錄。快取超過 `PROXY_CACHE_TTL_SECONDS` 視為過期，下次一般（非強制）呼叫時會重新驗證，不會被無限期信任。
 - **AC-6.5**：多個並行的區塊下載 thread 在選擇 proxy 時，絕不會有兩個 thread 同時持有同一個 proxy；等待 proxy 槽位的 thread 一旦下載被取消就會盡快放棄（不會無限期忙等）。
+- **AC-6.6**：同一個 proxy 連續下載失敗達 `PROXY_FAILURE_EVICTION_THRESHOLD` 次後，會在本次執行剩餘期間被降低優先序（從「已知可用」這一層選擇範圍移除），不再持續被優先選中；之後只要該 proxy 再度成功一次就會清除其失敗計數，不會被永久排除。直連（proxy index 0）不受此規則影響。
 
 ### REQ-7：取消下載
 - **AC-7.1**：在 `download()` 執行期間任何時間點呼叫 `Downloader.cancel()`（包含解 captcha、產生 URL、或下載區塊的過程中）都會讓該次呼叫丟出 `DownloadCancelled`，而不是繼續跑完或卡住。

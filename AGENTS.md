@@ -43,7 +43,7 @@ tests/                    # 對應 core/ 各模組；所有 requests 呼叫皆 m
 - **多執行緒共用狀態一律要有專屬 lock 保護**（NFR-2）：`working_proxy_indexes`、`_active_proxy_indexes`、`_bytes_downloaded`/`_done_count`、`url_locks[i]`、`proxy_locks[i]`。取消狀態只用單一 `stop_event`（`threading.Event`），不要再額外鏡射 boolean（見 `docs/ai/architecture.md` §3 的說明，這是刻意的設計決策，過去踩過雷）。
 - **`_acquire_proxy_lock` 絕不能用 blocking `.acquire()`**，一律 `acquire(blocking=False)` + 短 sleep 迴圈，且要在 `stop_event` 被設定時能提早退出（過去因 check-then-act race 導致死結）。
 - **`core/` 只透過建構子 callback**（`status_callback`／`progress_callback`／`proxy_state_callback`）跟外界溝通，不可在 `core/` 內加 `print()`／`logging`。
-- **proxy pool 是不可信通道**：來自 `proxyscrape.com`、只做輕量可達性驗證、proxy 這段連線本身是未加密明文 HTTP（即使目標是 HTTPS）。直連永遠優先，proxy 只是 fallback；改動這段邏輯前務必讀 `docs/ai/architecture.md` §4 與 `docs/ai/requirements.md` REQ-6。
+- **proxy pool 是不可信通道**：候選來自多個公開清單（`proxyscrape.com` 及數個 GitHub raw 清單）、只對真正的下載目標做輕量驗證、proxy 這段連線本身是未加密明文 HTTP（即使目標是 HTTPS）。直連永遠優先，proxy 只是 fallback；改動這段邏輯前務必讀 `docs/ai/architecture.md` §4 與 `docs/ai/requirements.md` REQ-6。
 - **例外分類要保持**（見 `docs/ai/architecture.md` §5）：`DownloadCancelled`（使用者取消，非錯誤）／`ChunkDownloadFailed`（區段重試耗盡）／`K2SFileNotFound`（可捕捉，不可 `sys.exit()` 殺掉整個 process）／`RuntimeError`（要附上可能原因，如 IP 被封鎖）／`ValueError`（輸入驗證，網路呼叫前就丟）。新增錯誤處理時比照這個分類，不要新增未分類的裸例外往外丟。
 
 ## 4. Code Style 與開發／測試指令

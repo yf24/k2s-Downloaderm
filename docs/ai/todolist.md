@@ -82,13 +82,15 @@
 
 ## R2-P4 — proxy 來源與生命週期管理（回應「proxyscrape 過時 proxy」問題）
 
-- [ ] **R2-10 proxy pool 品質改善**。現況：單一來源 `api.proxyscrape.com`（**v1 舊版 API**，官方已遷移至 v2/v3，v1 隨時可能停止服務 —— 屆時 `fetch_remote` 拿到空清單、退化成純直連而無明顯錯誤）；驗證只打 `api.myip.com`；`proxies.txt` 快取無 TTL；`working_proxy_indexes` 只進不出。免費公開 proxy 本質就是高汰換率＋MITM 風險（見 P2-3），**換一家來源只能緩解、不能根治**，重點應放在驗證與生命週期：
-  1. **升級／多來源**：改用 proxyscrape v2 endpoint，並把來源抽象成 provider 清單，聚合 GitHub 上定時更新的免費清單（如 `TheSpeedX/PROXY-List`、`monosans/proxy-list`、`proxifly/free-proxy-list` 的 raw URL）後去重 —— 多來源聯集能顯著提高「當下活著」的比例。
-  2. **驗證目標對齊**：`api.myip.com` 可達 ≠ 該 proxy 沒被 Keep2Share 封鎖。驗證改為（或加驗）對 `k2s.cc` 的輕量請求，直接篩掉對目標站無效的 proxy。（共享的公開 proxy 很可能早已被 k2s 封鎖或限制，這點讓「對目標站實測」比「泛用可達性檢查」重要得多。）
-  3. **快取 TTL**：`proxies.txt` 加時間戳，超過（例如 6~24 小時）自動視為過期觸發 refresh；啟動時可預設走已有的 `recheck_cached` 路徑。
-  4. **Runtime 降級**：proxy 進入 `working_proxy_indexes` 後即使開始連續失敗仍會被優先選中 —— 對每個 index 記錄連續失敗次數，超閾值即自 working 清單移除。
-  5. **使用者自備清單**：CLI flag／GUI 匯入自有 proxy 清單，讓在意 MITM 的使用者完全繞開公開清單。
-  6. 非 proxy 替代方案評估過不採用：Tor（免費多出口但慢、出口常被檔案站封鎖）、免費 VPN（不可程式化輪替）。是否真的需要 proxy，由 R2-11 的量測數據決定。
+- [~] **R2-10 proxy pool 品質改善**（2026-07-18 完成第 1~4 點；第 5 點使用者自備清單有意識延後，非本次範疇；第 6 點評估過不採用，無動作）。現況（改前）：單一來源 `api.proxyscrape.com`（**v1 舊版 API**，官方已遷移至 v2/v3，v1 隨時可能停止服務 —— 屆時 `fetch_remote` 拿到空清單、退化成純直連而無明顯錯誤）；驗證只打 `api.myip.com`；`proxies.txt` 快取無 TTL；`working_proxy_indexes` 只進不出。免費公開 proxy 本質就是高汰換率＋MITM 風險（見 P2-3），**換一家來源只能緩解、不能根治**，重點應放在驗證與生命週期：
+  1. [x] **升級／多來源**：`src/k2s_downloader/core/proxy.py` 新增 `_PROXY_SOURCES`（proxyscrape v2 endpoint + `TheSpeedX/PROXY-List`、`monosans/proxy-list`、`proxifly/free-proxy-list` 三個 GitHub raw 清單），`_fetch_all_sources()` 用 `ThreadPoolExecutor` 並行抓取＋合併去重，任一來源例外（`RequestException`／格式錯誤等）只會透過 `status_callback` 回報一則訊息並跳過，不會擋住其他來源。`_normalize_candidate()` 順便處理 proxifly 清單帶 `scheme://` 前綴的格式。**已用真實網路驗證**（本機 `.venv` 安裝相依套件後實際執行）：4 個來源皆可連線、格式如預期（均為 `ip:port` 純文字，proxifly 需用 `proxies/protocols/http/data.txt` 子路徑取得純 HTTP 清單並去除 `http://` 前綴）。
+  2. [x] **驗證目標對齊**：驗證方式從對 `api.myip.com` 發 GET 改為對 `PROXY_VALIDATION_URL = "https://k2s.cc/"` 發 HEAD（`session.head()`），且新增「非 2xx/3xx 視為驗證失敗」判斷（改前只要不丟例外就算通過，完全不管 status code）。**已用真實網路驗證**：對 300 個候選跑一次真實 refresh，47 個通過（約 16%），耗時約 62 秒，證實「對目標站實測」確實會篩掉泛用可達性檢查抓不到的失效 proxy。
+  3. [x] **快取 TTL**：新增 `PROXY_CACHE_TTL_SECONDS = 12 * 60 * 60`（12 小時，落在建議的 6~24 小時區間）。`get_working_proxies()` 用 `cache_path.stat().st_mtime` 判斷快取年齡；一般呼叫（`refresh=False`、`recheck_cached=False`）若快取已過期，不再直接回傳，而是自動比照「建議做法」原文所說走既有的 `recheck_cached` 路徑（重新驗證既有清單，不是整個重新向所有來源抓取）。
+  4. [x] **Runtime 降級**：新增 `Downloader._note_proxy_failure()`（`downloader.py`），由 `_mark_chunk_failed` 新增的 `proxy_idx` 參數觸發，以 `_proxy_consecutive_failures` dict（與 `working_proxy_indexes` 共用 `_working_proxy_lock`）追蹤連續失敗次數；達 `PROXY_FAILURE_EVICTION_THRESHOLD = 3` 即移出 `working_proxy_indexes`（不影響 `_acquire_proxy_lock` 隨機 fallback 層仍可能選到它；之後若成功會清除計數並重新加回清單，不是永久拉黑）。直連（index 0）不受影響（`_acquire_proxy_lock` 本就無條件優先嘗試它）。`refresh_proxies()` 換一批全新 proxy 清單時一併清空 `_proxy_consecutive_failures`（舊 index 對新清單無意義）。
+  - **未完成、有意識延後**：第 5 點「使用者自備清單」（CLI flag／GUI 匯入自有 proxy）需要碰 CLI 參數解析與 GUI 檔案匯入 UI，是與品質改善不同性質的獨立功能，留待有需求時再立項。
+  - **不採用**：第 6 點已評估 Tor／免費 VPN 兩個替代方案，維持不採用的結論。
+  - 測試：`tests/test_proxy_pool_quality.py`（9 個，涵蓋多來源合併、單一來源失敗不擋其他來源、scheme 前綴正規化、驗證目標改對 k2s.cc、非 2xx 視為失敗、快取 TTL 新鮮/過期兩種路徑）；`tests/test_downloader_proxy_degradation.py`（9 個，涵蓋直連 index 0 永不追蹤、未達閾值不移除、達閾值移除、移除有 log、移除後仍可能被隨機 fallback 選中、`_mark_chunk_failed` 有無 `proxy_idx` 的差異、`refresh_proxies()` 重置狀態、成功後清除失敗計數）；既有 `tests/test_proxy_preference_and_cache.py` 三個測試因驗證方式從「不丟例外即成功」改為「不丟例外且 status_code < 400 才成功」而更新 mock（`.get` 改 `.head`、補上明確的 `status_code=200`）。全部 148 項測試通過，`ruff check .` 乾淨。
+  - 文件：`AGENTS.md`、`Readme.md`（Security Note）、`docs/ai(+human)/architecture.md` §4（新增來源/驗證/降級三段說明＋2 個新常數的 timeout/retry 表格條目）、`docs/ai(+human)/requirements.md`（AC-6.3/AC-6.4 改寫、新增 AC-6.6）皆已同步更新。
 
 ## R2-P5 — 根本目的（突破 50KB/s）達成度檢視
 
@@ -167,10 +169,10 @@
 > 第一輪（P0 ~ P5）的處理順序與完成紀錄已隨該輪一併封存，見
 > [`todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md) 的「完成紀錄」段落。
 
-第二輪（R2-1 ~ R2-13）：R2-1~R2-9、R2-13 已完成；R2-11 部分完成（telemetry 與零成本提示已做，「依數據
-調整預設」需要真實使用數據才能決定，留待之後）（見各項狀態與 PR 連結）。R2-10、R2-12 仍未認領。
-R2-10（proxy 投資深度）與 R2-12（99% 尾端崩落對策選擇）建議等 R2-11 的 telemetry 累積到真實使用數據後
-再決定；R2-12 的對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。
+第二輪（R2-1 ~ R2-13）：R2-1~R2-9、R2-13 已完成；R2-10 完成第 1~4 點（第 5 點延後、第 6 點不採用）；
+R2-11 部分完成（telemetry 與零成本提示已做，「依數據調整預設」需要真實使用數據才能決定，留待之後）
+（見各項狀態與 PR 連結）。R2-12 仍未認領，建議等 R2-11 的 telemetry 累積到真實使用數據後再決定要採用
+哪個尾端對策；其對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。
 
 **R2-P6（R2-14、R2-15）** 是 2026-07-17 使用者直接提出的兩項流程／文件維護改善（review 留言截斷問題、
 todolist 歸檔機制），與上述 R2-1~R2-13 的程式碼修正屬不同性質；兩項皆已完成（見各項狀態）。本檔（含

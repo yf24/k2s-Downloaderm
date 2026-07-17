@@ -70,9 +70,9 @@ class TestProxyCachePathConfigurable:
         proxyscrape_response.text = "1.2.3.4:8080"
 
         fake_future = MagicMock()
-        fake_future.result.return_value = MagicMock()
+        fake_future.result.return_value = MagicMock(status_code=200)
         fake_session = MagicMock()
-        fake_session.get.return_value = fake_future
+        fake_session.head.return_value = fake_future
 
         with patch("k2s_downloader.core.proxy.requests.get", return_value=proxyscrape_response), \
              patch("k2s_downloader.core.proxy.FuturesSession", return_value=fake_session), \
@@ -95,7 +95,7 @@ class TestProxyCachePathConfigurable:
         fake_future = MagicMock()
         fake_future.result.side_effect = Exception("simulated failure")
         fake_session = MagicMock()
-        fake_session.get.return_value = fake_future
+        fake_session.head.return_value = fake_future
 
         with patch("k2s_downloader.core.proxy.requests.get", return_value=proxyscrape_response), \
              patch("k2s_downloader.core.proxy.FuturesSession", return_value=fake_session), \
@@ -112,16 +112,16 @@ class TestProxyCachePathConfigurable:
         custom_path.write_text("1.2.3.4:8080\n5.6.7.8:8080")
 
         good_future = MagicMock()
-        good_future.result.return_value = MagicMock()
+        good_future.result.return_value = MagicMock(status_code=200)
         dead_future = MagicMock()
         dead_future.result.side_effect = Exception("dead proxy")
 
-        def fake_get(url, *, proxies, timeout):
+        def fake_head(url, *, proxies, timeout):
             proxy_value = proxies["https"].removeprefix("http://")
             return good_future if proxy_value == "1.2.3.4:8080" else dead_future
 
         fake_session = MagicMock()
-        fake_session.get.side_effect = fake_get
+        fake_session.head.side_effect = fake_head
 
         with patch("k2s_downloader.core.proxy.FuturesSession", return_value=fake_session), \
              patch("k2s_downloader.core.proxy.as_completed", side_effect=lambda futures: list(futures)), \

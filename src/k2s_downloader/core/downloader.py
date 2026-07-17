@@ -174,6 +174,13 @@ MAX_CHUNK_RETRIES = 8
 # Exponential backoff between retry attempts for a single chunk.
 CHUNK_RETRY_BACKOFF_BASE = 1.0
 CHUNK_RETRY_BACKOFF_CAP = 30.0
+# R2-10: consecutive chunk-download failures through the same proxy index
+# before it's evicted from working_proxy_indexes (the "known good, prefer
+# these" tier _acquire_proxy_lock checks before falling back to a random
+# pick). Previously a proxy only ever got added to that list, never
+# removed, so one that degraded mid-download (or was flaky from the start)
+# kept being preferentially reselected for the rest of the run.
+PROXY_FAILURE_EVICTION_THRESHOLD = 3
 
 
 def _emit_status(callback: StatusCallback, message: str) -> None:
@@ -289,6 +296,11 @@ class Downloader:
         self.working_proxy_indexes: List[int] = []
         self.url_locks: List[threading.Lock] = []
         self._active_proxy_indexes: set[int] = set()
+        # R2-10: consecutive-failure count per proxy index, guarded by
+        # _working_proxy_lock alongside working_proxy_indexes (the two are
+        # always updated together). Index 0 (direct connection) is never
+        # tracked -- see _note_proxy_failure.
+        self._proxy_consecutive_failures: Dict[int, int] = {}
 
     @staticmethod
     def extract_file_id(url: str) -> str:
@@ -520,16 +532,21 @@ class Downloader:
                 pass
         return removed
 
-    def _mark_chunk_failed(self, range_meta: Dict[str, object], reason: str) -> None:
+    def _mark_chunk_failed(
+        self, range_meta: Dict[str, object], reason: str, *, proxy_idx: Optional[int] = None
+    ) -> None:
         """Record a failed chunk attempt with a bounded retry budget.
 
         Increments ``range_meta["attempts"]`` and schedules the next retry
         with exponential backoff. Once ``MAX_CHUNK_RETRIES`` is exceeded,
         marks the range as permanently ``failed`` so the scheduling loop in
         ``_download_once`` can stop and raise ``ChunkDownloadFailed`` instead
-        of retrying forever.
+        of retrying forever. ``proxy_idx``, when given, also feeds R2-10's
+        per-proxy failure tracking (see ``_note_proxy_failure``).
         """
         reason = _truncate_error_message(reason)
+        if proxy_idx is not None:
+            self._note_proxy_failure(proxy_idx)
         attempts = int(range_meta.get("attempts", 0)) + 1
         range_meta["attempts"] = attempts
         range_meta["last_error"] = reason
@@ -546,6 +563,38 @@ class Downloader:
             f"Chunk attempt {attempts}/{MAX_CHUNK_RETRIES} failed ({reason}); "
             f"retrying in {backoff:.1f}s."
         )
+
+    def _note_proxy_failure(self, proxy_idx: int) -> None:
+        """Track a chunk-download failure against ``proxy_idx``; evict it
+        from ``working_proxy_indexes`` once ``PROXY_FAILURE_EVICTION_THRESHOLD``
+        consecutive failures are reached (R2-10).
+
+        Index 0 (direct connection) is exempt: ``_acquire_proxy_lock``
+        always tries it first regardless of ``working_proxy_indexes``
+        membership, so tracking failures for it here would have no effect
+        and would only pollute the failure-count dict.
+
+        Eviction only removes ``proxy_idx`` from the "known good, prefer
+        these" tier -- it can still be picked up again via the random
+        fallback tier, and a later success clears its count and re-adds it
+        (see the success path in ``_download_chunk``), so a proxy that
+        recovers becomes eligible again rather than being blacklisted
+        forever.
+        """
+        if proxy_idx == 0:
+            return
+        evicted = False
+        with self._working_proxy_lock:
+            count = self._proxy_consecutive_failures.get(proxy_idx, 0) + 1
+            self._proxy_consecutive_failures[proxy_idx] = count
+            if count >= PROXY_FAILURE_EVICTION_THRESHOLD and proxy_idx in self.working_proxy_indexes:
+                self.working_proxy_indexes.remove(proxy_idx)
+                evicted = True
+        if evicted:
+            self.log(
+                f"Proxy {self.proxies[proxy_idx]} failed {count} times in a row; "
+                "deprioritizing it."
+            )
 
     def _acquire_proxy_lock(self) -> Optional[int]:
         """Pick a proxy and atomically acquire its lock.
@@ -593,6 +642,11 @@ class Downloader:
         self.proxy_locks = [threading.Lock() for _ in self.proxies]
         with self._working_proxy_lock:
             self.working_proxy_indexes = []
+            # Old counts reference indexes into the previous self.proxies
+            # list; a fresh list makes them meaningless (and could wrongly
+            # evict an index that now points at a completely different,
+            # never-tried proxy).
+            self._proxy_consecutive_failures = {}
         self._active_proxy_indexes = set()
         self._notify_proxy_state()
 
@@ -882,6 +936,7 @@ class Downloader:
                     self._mark_chunk_failed(
                         range_meta,
                         f"HTTP {response.status_code} via proxy {proxy_value or 'LOCAL'}",
+                        proxy_idx=proxy_idx,
                     )
                     return
 
@@ -913,6 +968,7 @@ class Downloader:
                 self._mark_chunk_failed(
                     range_meta,
                     f"request error via proxy {proxy_value or 'LOCAL'}: {exc}",
+                    proxy_idx=proxy_idx,
                 )
                 return
 
@@ -920,7 +976,9 @@ class Downloader:
                 self._report_progress(-bytes_written, ctx, is_direct=proxy_idx == 0)
                 tmp_write_path.unlink(missing_ok=True)
                 self._mark_chunk_failed(
-                    range_meta, f"size mismatch: got {bytes_written} expected {expected_bytes}"
+                    range_meta,
+                    f"size mismatch: got {bytes_written} expected {expected_bytes}",
+                    proxy_idx=proxy_idx,
                 )
                 # Do NOT release url_locks[thread_index] here: the ``finally``
                 # below is the single release point. Releasing early meant the
@@ -936,6 +994,9 @@ class Downloader:
                 is_newly_known = proxy_idx not in self.working_proxy_indexes
                 if is_newly_known:
                     self.working_proxy_indexes.append(proxy_idx)
+                # A success clears any failure streak (R2-10) so a proxy
+                # that recovers isn't left one step away from re-eviction.
+                self._proxy_consecutive_failures.pop(proxy_idx, None)
             if is_newly_known:
                 self._notify_proxy_state()
 
@@ -964,7 +1025,9 @@ class Downloader:
             # failure is, instead of the old blanket suppress-and-ignore.
             tmp_write_path.unlink(missing_ok=True)
             self._mark_chunk_failed(
-                range_meta, f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}"
+                range_meta,
+                f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}",
+                proxy_idx=proxy_idx,
             )
         finally:
             if added_to_active:

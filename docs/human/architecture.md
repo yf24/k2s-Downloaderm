@@ -77,7 +77,11 @@ CLI/GUI
 
 ## 4. Proxy 處理設計
 
-`proxy.py::get_working_proxies()` 是唯一的 proxy 候選來源。其回傳值第 0 個元素恆為 `None`（代表「不用 proxy，直連」）— 這個不變量是關鍵依賴：`Downloader._acquire_proxy_lock()` 會檢查 `self.proxies[0] is None`，並永遠優先嘗試搶佔這個槽位，才會 fallback 到已知可用或隨機選擇的 proxy。候選清單來自 `proxyscrape.com`（公開、未經驗證的清單），僅做輕量驗證（對 `api.myip.com` 做一次 HTTPS 可達性測試）；驗證過的結果會快取到磁碟（`cache_path`，可設定，預設為 CWD 下的 `proxies.txt`），除非要求 `refresh=True` 或 `recheck_cached=True`，否則之後的執行可以跳過重新驗證。
+`proxy.py::get_working_proxies()` 是唯一的 proxy 候選來源。其回傳值第 0 個元素恆為 `None`（代表「不用 proxy，直連」）— 這個不變量是關鍵依賴：`Downloader._acquire_proxy_lock()` 會檢查 `self.proxies[0] is None`，並永遠優先嘗試搶佔這個槽位，才會 fallback 到已知可用或隨機選擇的 proxy。
+
+**來源與驗證（R2-10）**：候選清單改為同時併發抓取多個各自獨立維護的公開清單（`_PROXY_SOURCES`：proxyscrape 的 v2 API，外加三個 GitHub 上的 raw 清單 —— `TheSpeedX/PROXY-List`、`monosans/proxy-list`、`proxifly/free-proxy-list`），合併去重；每個來源都是 best-effort，任一來源掛掉、被限速、或改變回應格式都不會擋住其他來源（先前唯一來源是 proxyscrape 已停止維護的 v1 API，是單一失效點，一旦停擺會讓整個 app 靜默退化成純直連）。驗證改為對真正的下載目標發出 HTTPS `HEAD` 請求（`PROXY_VALIDATION_URL = "https://k2s.cc/"`，而非先前那種泛用可達性檢查 `api.myip.com`），且非 2xx/3xx 的回應會被視為驗證失敗（跟連線例外一視同仁）——一個「連得上但已經被 Keep2Share 封鎖/限速」的 proxy，正是這個改動要篩掉的對象。驗證過的結果會快取到磁碟（`cache_path`，可設定，預設為 CWD 下的 `proxies.txt`）；一般呼叫（`refresh=False`、`recheck_cached=False`）只有在快取還在 `PROXY_CACHE_TTL_SECONDS`（12 小時）內才會直接回傳——超過時效就自動比照 `recheck_cached=True` 處理（重新驗證既有清單，而非整個重新向所有來源抓取），不再無限期信任舊快取。
+
+**Runtime 降級（R2-10）**：`Downloader` 透過 `_note_proxy_failure`（由 `_mark_chunk_failed` 的可選 `proxy_idx` 參數觸發）追蹤每個 proxy index 的連續失敗次數（`_proxy_consecutive_failures`，與 `working_proxy_indexes` 共用 `_working_proxy_lock` 保護）。連續失敗超過 `PROXY_FAILURE_EVICTION_THRESHOLD`（3 次）後，該 proxy 會被移出 `working_proxy_indexes`（先前這份清單只進不出，一個下載途中變差的 proxy 會在剩餘全程持續被優先選中）。移除只影響 `_acquire_proxy_lock` 優先檢查的「已知可用」這一層——仍可能透過隨機 fallback 層再度被選中，之後若成功，會清除其失敗計數並重新加回 `working_proxy_indexes`，讓恢復正常的 proxy 能再次被使用，而非永久拉黑。索引 0（直連）不受此機制影響，因為 `_acquire_proxy_lock` 一律無條件優先嘗試它，與清單成員與否無關。
 
 安全性立場（另見 [Readme.md](../../Readme.md) 的「Security Note: Public Proxies」段落）：proxy 這段連線本身即使目標網址是 HTTPS，也是未經驗證的明文 HTTP（`requests` 是透過 HTTP `CONNECT` 把 HTTPS 隧道到這個 proxy），因此惡意的 proxy 操作者有能力觀察或竄改經過的流量。這是為了規避單一 IP 速率限制而刻意做的取捨並已明確記載，不是疏忽 — 直連永遠優先（見第 3 節），proxy pool 純粹是 fallback。
 
@@ -102,6 +106,8 @@ CLI/GUI
 | `CHUNK_RETRY_BACKOFF_BASE` / `_CAP` | 1.0 秒 / 30.0 秒 | 區段重試之間的指數 backoff |
 | `MAX_CAPTCHA_ATTEMPTS` | 3 | 放棄前允許 captcha 答錯的次數 |
 | `MAX_URL_BATCH_ROUNDS` | 3 | 同一個 proxy 連續幾輪拿不到任何新 URL 就換下一個 |
+| `PROXY_FAILURE_EVICTION_THRESHOLD` | 3 | 同一個 proxy 連續失敗幾次後從 `working_proxy_indexes` 移除（R2-10） |
+| `PROXY_CACHE_TTL_SECONDS` | 12 小時 | 快取的 proxy 清單超過多久視為過期並重新驗證（R2-10，`proxy.py`） |
 
 ### Timeout 一覽
 
@@ -115,7 +121,7 @@ CLI/GUI
 | `DEFAULT_TIMEOUT` | `k2s_client.py` | 15 秒 | Keep2Share API 一般呼叫（取得 captcha、查詢檔名、批次產生 URL） |
 | `CAPTCHA_SOLVE_TIMEOUT` | `k2s_client.py` | 5 秒 | 專門給每個 proxy 的 captcha 解答探測 — 刻意設短，避免單一失效 proxy 卡住整個 captcha 迴圈 |
 | `HTTPS_TIMEOUT` | `proxy.py` | 5 秒 | Proxy 驗證階段對每個候選的可達性測試 |
-| `PROXYSCRAPE_FETCH_TIMEOUT` | `proxy.py` | 30 秒 | 抓取原始候選清單（單一較大請求，非逐一探測） |
+| `SOURCE_FETCH_TIMEOUT` | `proxy.py` | 30 秒 | 從單一來源抓取候選清單（單一較大請求，非逐一探測） |
 
 ## 6. GUI 整合
 
