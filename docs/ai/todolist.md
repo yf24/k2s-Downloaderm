@@ -229,7 +229,7 @@
 
 ## R2-P2 — 資源使用與死碼
 
-- [ ] **R2-7 每個 chunk 整段緩衝在記憶體 → 峰值可達數百 MiB**
+- [x] **R2-7 每個 chunk 整段緩衝在記憶體 → 峰值可達數百 MiB**（2026-07-17 與 R2-13 一併完成，分支 `feature/r2-7-r2-13-streaming-resume`；測試：`tests/test_downloader_resume_and_streaming.py::TestChunkStreamsIncrementallyToTmpThenRenames`、`TestMergePartsStreamsInsteadOfBuffering`。實作：`_download_chunk` 改為邊收邊寫 `.partNN.tmp`（每次 write 後 `flush()` 讓磁碟即時可見），確認完整位元組數後才 `replace()` 成最終 `.partNN`（原子改名，Windows-safe）；失敗/例外路徑一律清掉未完成的 `.tmp`。`_merge_parts` 改用 `shutil.copyfileobj` 串流合併；排程迴圈重用分支原本 `part_path.read_bytes()` 只為取長度也一併改成 `part_path.stat().st_size`。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_download_chunk` 的 `io.BytesIO`；`_merge_parts` 的一次性 `chunk.read()`）
   - 問題：預設 20 threads × ≥20MiB split ≈ 400MiB 峰值；媒體檢查失敗重試會把 split 加倍再翻倍。對打包成 exe 給一般 Windows 使用者的情境不友善。
   - 建議做法：chunk 改為邊下邊寫暫存檔（`.partNN.tmp` 完成後 rename 成 `.partNN`，rename 的原子性同時消除「寫一半的 part 被重用分支誤判完整」的風險）；`_merge_parts` 改 `shutil.copyfileobj` 串流合併。
@@ -289,7 +289,11 @@
   - **驗證方式**：R2-11 的 telemetry 先行 —— 尾端同時記錄「活躍連線數」與「聚合速度」，若兩者同步下降即證實主因是平行度崩落（而非封鎖/額度），再依數據挑選上面哪個對策。
   - 測試：以 mock 驗證尾端派工策略（冗餘派工的先完成者勝出、輸家取消不寫檔）；切分策略的 ranges 正確性沿用 `TestBuildRangesContiguity` 模式。
 
-- [ ] **R2-13 可見且可靠的斷點續傳（使用者實際需求，2026-07-17 立項）**
+- [x] **R2-13 可見且可靠的斷點續傳（使用者實際需求，2026-07-17 立項；2026-07-17 完成，分支 `feature/r2-7-r2-13-streaming-resume`）**
+  - 測試：`tests/test_downloader_resume_and_streaming.py::TestResumeManifest`（manifest schema、成功後刪除、相符時跳過已完成區段、file_id 不符時拒絕續傳並清殘留檔、manifest 記錄已完成但實體檔案遺失時退回全新下載）。
+  - 實作摘要：新增 `Downloader._manifest_path`/`_load_manifest`/`_persist_manifest`/`_prepare_resume`/`_clear_stale_part_files`；manifest（`<filename>.manifest.json`，flat 於 `tmp_dir`）記錄 file_id、total_size、split_size、split_count、各區段 range/bytes/downloaded，寫入用 `.tmp`+`replace()` 保證 atomic overwrite，並以專屬 `_manifest_lock` 序列化並行寫入。`_download_once` 新增 `file_id` 參數（`download()` 帶入真正的 file_id，其餘呼叫端預設空字串維持相容）；開始下載前呼叫 `_prepare_resume`：manifest 的 file_id/total_size/split layout 皆相符才信任其「已完成」標記，且仍會逐一對照磁碟上實際 part 檔大小再認定（manifest 只記錄意圖，磁碟檔案才是依據）；不符或缺席則呼叫 `_clear_stale_part_files` 清掉同檔名下所有殘留 part／manifest，避免不同來源的檔案因剛好同名同大小而被誤接續。成功合併後刪除 manifest；取消／永久失敗則保留（供下次續傳）。狀態訊息會回報「Resuming: found N/M segment(s)...」或「No previous progress found...」。
+  - **範疇變更已同步**：`docs/ai/requirements.md`／`docs/human/requirements.md` 新增 REQ-11（含 AC-11.1~11.4），並更新 §2 Scope 的 in/out-of-scope 敘述與 AC-3.5/AC-3.6 措辭；另加 NFR-6 記錄串流寫入的有界記憶體特性。
+  - 未完成的子項（有意識延後，非本次範疇）：GUI 顯示暫存目錄路徑＋「開啟資料夾」按鈕（R2-13 建議做法第 3 點的 UI 部分）尚未實作 —— 目前的可見性透過 `status_callback` 訊息（GUI 的 log 面板本就會顯示）與 manifest/part 檔本身在磁碟上可見達成；若要加開資料夾按鈕，需要碰 `gui/main_window.py`（無自動測試覆蓋，見 AGENTS.md 例外）。
   - **使用者痛點**：下載過程在磁碟上看不到任何暫存檔／進度落地，中斷後不確定上次下載到哪、下次能不能接續、甚至懷疑根本沒下載到任何東西。
   - **成因分析**（對照現有程式碼）：
     1. part 檔只在 chunk **完整下載後**才一次寫入（`_download_chunk` 的 `io.BytesIO` 緩衝，見 R2-7）—— 下載中資料全在 RAM，磁碟上看不到成長中的檔案，中斷即全部丟失。

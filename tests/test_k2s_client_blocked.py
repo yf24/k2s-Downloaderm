@@ -220,7 +220,7 @@ class TestDownloaderIntegration:
         downloader.proxies = [None]
         seen = {}
 
-        def fake_download_once(urls, filename, threads, bytes_per_split):
+        def fake_download_once(urls, filename, threads, bytes_per_split, file_id=""):
             seen["threads"] = threads
             seen["urls"] = list(urls)
             return tmp_path / filename
