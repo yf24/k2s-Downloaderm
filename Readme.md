@@ -27,7 +27,7 @@ uv run k2s-downloader "https://k2s.cc/file/abc123" --threads 20 --split-size 20M
 ```
 
 ## Security Note: Public Proxies
-This tool can route chunk downloads through third-party HTTPS proxies to work around IP blocks/rate limits. The candidate list is fetched from a public, unauthenticated source (proxyscrape.com) and only lightly vetted (a basic reachability check), and the proxy connection itself is plain, unauthenticated HTTP. A malicious or compromised proxy in this list is in a position to observe or tamper with traffic routed through it. The downloader always prefers a direct connection over a proxy when one is available; only fall back to the proxy pool for downloads where that risk is acceptable to you.
+This tool can route chunk downloads through third-party HTTPS proxies to work around IP blocks/rate limits. The candidate list is fetched from several public, unauthenticated sources (proxyscrape.com plus a few GitHub-hosted lists) and vetted with a lightweight connectivity check against the actual download target, and the proxy connection itself is plain, unauthenticated HTTP. A malicious or compromised proxy in this list is in a position to observe or tamper with traffic routed through it. The downloader always prefers a direct connection over a proxy when one is available; only fall back to the proxy pool for downloads where that risk is acceptable to you.
 
 ## GUI Usage
 ```

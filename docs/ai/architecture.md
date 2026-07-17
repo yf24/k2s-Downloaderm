@@ -77,7 +77,11 @@ The previous implementation scanned for a proxy lock reporting `locked() == Fals
 
 ## 4. Proxy Handling Design
 
-`proxy.py::get_working_proxies()` is the sole source of proxy candidates. Its return value always has `None` as element 0 (meaning "no proxy, direct connection") — this invariant is load-bearing: `Downloader._acquire_proxy_lock()` checks `self.proxies[0] is None` and always tries to acquire that slot first, before falling back to any known-good or randomly-chosen proxy. Candidates come from `proxyscrape.com` (a public, unauthenticated list) and are lightly validated with a single HTTPS reachability probe against `api.myip.com`; validated results are cached to disk (`cache_path`, configurable, defaulting to `proxies.txt` in the CWD) so a subsequent run can skip re-validation unless `refresh=True` or `recheck_cached=True` is requested.
+`proxy.py::get_working_proxies()` is the sole source of proxy candidates. Its return value always has `None` as element 0 (meaning "no proxy, direct connection") — this invariant is load-bearing: `Downloader._acquire_proxy_lock()` checks `self.proxies[0] is None` and always tries to acquire that slot first, before falling back to any known-good or randomly-chosen proxy.
+
+**Sourcing and validation (R2-10)**: candidates are fetched concurrently from several independently-maintained public lists (`_PROXY_SOURCES`: proxyscrape's v2 API plus three GitHub-hosted raw lists — `TheSpeedX/PROXY-List`, `monosans/proxy-list`, `proxifly/free-proxy-list`), merged and deduplicated; each source is best-effort, so one going down, rate-limiting, or changing its response format never blocks the others (previously the sole source was proxyscrape's now-deprecated v1 API, a single point of failure that could silently degrade the app to direct-connection-only). Candidates are validated with an HTTPS `HEAD` request against the real download target (`PROXY_VALIDATION_URL = "https://k2s.cc/"`, not a generic reachability check like the previous `api.myip.com`) and a non-2xx/3xx response is treated as a validation failure the same as a connection error — a proxy that's reachable but already blocked/rate-limited by Keep2Share specifically is exactly the kind of candidate this is meant to filter out. Validated results are cached to disk (`cache_path`, configurable, defaulting to `proxies.txt` in the CWD); a plain call (`refresh=False`, `recheck_cached=False`) returns the cache as-is only while it's fresher than `PROXY_CACHE_TTL_SECONDS` (12h) — once stale it's automatically treated like `recheck_cached=True` (revalidate what's cached, not a full re-fetch from every source) instead of being trusted indefinitely.
+
+**Runtime degradation (R2-10)**: `Downloader` tracks consecutive chunk-download failures per proxy index (`_proxy_consecutive_failures`, guarded by `_working_proxy_lock` alongside `working_proxy_indexes`) via `_note_proxy_failure`, called from `_mark_chunk_failed`'s optional `proxy_idx` parameter. Past `PROXY_FAILURE_EVICTION_THRESHOLD` (3) consecutive failures, the proxy is dropped from `working_proxy_indexes` (previously indexes were only ever appended, never removed, so a proxy that degraded mid-download kept being preferentially reselected for the rest of the run). Eviction only removes it from the "known good" tier `_acquire_proxy_lock` checks first — it's still reachable via the random-fallback tier, and a later success clears its failure count and re-adds it to `working_proxy_indexes`, so a proxy that recovers becomes eligible again rather than being permanently blacklisted. Index 0 (direct connection) is exempt from all of this, since `_acquire_proxy_lock` always tries it first unconditionally regardless of list membership.
 
 Security posture (see also [Readme.md](../../Readme.md)'s "Security Note: Public Proxies" section): the proxy hop itself is unauthenticated plain HTTP even when the target URL is HTTPS (`requests` tunnels HTTPS through an HTTP `CONNECT` to the proxy), so a malicious proxy operator is positioned to observe or tamper with routed traffic. This is a deliberate, documented tradeoff for working around per-IP rate limits, not an oversight — direct connection is always preferred (§ 3) and the proxy pool is purely a fallback.
 
@@ -102,6 +106,8 @@ Retry/backoff parameters (module-level constants in `downloader.py` / `k2s_clien
 | `CHUNK_RETRY_BACKOFF_BASE` / `_CAP` | 1.0s / 30.0s | Exponential backoff between chunk retry attempts |
 | `MAX_CAPTCHA_ATTEMPTS` | 3 | Rejected captcha answers before giving up |
 | `MAX_URL_BATCH_ROUNDS` | 3 | Consecutive zero-progress rounds fetching download URLs from one proxy before trying the next |
+| `PROXY_FAILURE_EVICTION_THRESHOLD` | 3 | Consecutive chunk failures via one proxy before it's evicted from `working_proxy_indexes` (R2-10) |
+| `PROXY_CACHE_TTL_SECONDS` | 12h | Age at which a cached proxy list is treated as stale and revalidated instead of returned as-is (R2-10, `proxy.py`) |
 
 ### Timeout inventory
 
@@ -115,7 +121,7 @@ Every outbound HTTP call in this project carries an explicit timeout (NFR-1); no
 | `DEFAULT_TIMEOUT` | `k2s_client.py` | 15s | General Keep2Share API calls (captcha fetch, filename lookup, URL batch generation) |
 | `CAPTCHA_SOLVE_TIMEOUT` | `k2s_client.py` | 5s | The per-proxy captcha-solve probe specifically — deliberately shorter so one dead proxy doesn't stall the whole captcha loop |
 | `HTTPS_TIMEOUT` | `proxy.py` | 5s | Per-candidate reachability probe during proxy validation |
-| `PROXYSCRAPE_FETCH_TIMEOUT` | `proxy.py` | 30s | Fetching the raw candidate list (one larger request, not a per-candidate probe) |
+| `SOURCE_FETCH_TIMEOUT` | `proxy.py` | 30s | Fetching a candidate list from one source (one larger request, not a per-candidate probe) |
 
 ## 6. GUI Integration
 
