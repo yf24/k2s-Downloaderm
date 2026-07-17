@@ -5,14 +5,15 @@
 ## 0. 建議閱讀順序（開工前）
 
 1. 本文件（`AGENTS.md`）— 導覽 + 硬規則速查
-2. [`docs/ai/requirements.md`](docs/ai/requirements.md) — canonical 需求文件（REQ/AC 逐項驗收標準）
-3. [`docs/ai/architecture.md`](docs/ai/architecture.md) — canonical 架構文件（module map、control flow、threading model、error taxonomy）
-4. [`docs/ai/todolist.md`](docs/ai/todolist.md) — 依優先序（P0～P5）排列的問題追蹤清單／開發 backlog
-5. [`CONTRIBUTING.md`](CONTRIBUTING.md) — 開發流程、code style、測試慣例、commit 格式（人類與 agent 共用）
+2. [`docs/ai/HANDOFF.md`](docs/ai/HANDOFF.md) — 最新進度快照（目前有哪個 PR 在進行、已知殘留問題），動態內容，開工前務必先看
+3. [`docs/ai/requirements.md`](docs/ai/requirements.md) — canonical 需求文件（REQ/AC 逐項驗收標準）
+4. [`docs/ai/architecture.md`](docs/ai/architecture.md) — canonical 架構文件（module map、control flow、threading model、error taxonomy）
+5. [`docs/ai/todolist.md`](docs/ai/todolist.md) — 依優先序（P0～P5）排列的問題追蹤清單／開發 backlog
+6. [`CONTRIBUTING.md`](CONTRIBUTING.md) — 開發流程、code style、測試慣例、commit 格式（人類與 agent 共用）
 
 `docs/ai/` 是 AI 適用的 canonical 版本（英文撰寫）；`docs/human/` 是對應的人類可讀繁體中文版本，內容應與 `docs/ai/` 保持同步。`Readme.md`（根目錄，大寫 R）是使用者導向的安裝／使用說明，不是架構文件。完整文件索引見 [`docs/README.md`](docs/README.md)。
 
-若你看到根目錄還留著 `readme-en.md`、`readme-zh.md`、`requirements-en.md`、`requirements-zh.md`、`todolist.md`、`.claudeprompt` 這幾個檔案，且內容只有一兩行「已搬移」提示，代表這些是 2026-07-17 文件整理後留下的轉址 stub（因當時串接的 GitHub 工具沒有刪除檔案的能力）。請直接依 stub 指向的新路徑閱讀，不要以舊檔內容為準；有能力的話歡迎直接刪除這些 stub 檔案。
+若你看到根目錄還留著 `readme-en.md`、`readme-zh.md`、`requirements-en.md`、`requirements-zh.md`、`todolist.md`、`.claudeprompt` 這幾個檔案，且內容只有一兩行「已搬移」提示，代表這些是 2026-07-17 文件整理後留下的轉址 stub（因當時串接的 GitHub 工具沒有刪除檔案的能力，詳見 [`docs/ai/HANDOFF.md`](docs/ai/HANDOFF.md)）。請直接依 stub 指向的新路徑閱讀，不要以舊檔內容為準；有能力的話歡迎直接刪除這些 stub 檔案。
 
 ## 1. 專案是什麼
 
@@ -51,7 +52,7 @@ tests/                    # 對應 core/ 各模組；所有 requests 呼叫皆 m
 
 完整規則見 [`CONTRIBUTING.md`](CONTRIBUTING.md)（環境設定、`uv sync --extra dev`、`uv run pytest -q`、`uv run ruff check .`、commit message 格式、測試慣例）。這裡只強調兩條最容易被忽略的：
 
-- 程式碼註解一律英文；敘述性文件（`Readme.md`、`docs/human/*.md`、`docs/ai/todolist.md`）預設繁體中文（台灣用語），技術／程式名詞保留英文。
+- 程式碼註解一律英文；敘述性文件（`Readme.md`、`docs/human/*.md`、`docs/ai/todolist.md`、`docs/ai/HANDOFF.md`）預設繁體中文（台灣用語），技術／程式名詞保留英文。
 - 修 bug 時做最小、針對性的 diff；`docs/ai/todolist.md` 用優先序（P0 最嚴重～P5 文件／DX）追蹤問題，不要把不相關的改動混進同一個 PR。
 
 ## 5. Tracking：`docs/ai/todolist.md`
@@ -82,4 +83,4 @@ tests/                    # 對應 core/ 各模組；所有 requests 呼叫皆 m
 
 ## 8. 目前狀態
 
-本檔刻意不記錄動態的開發進度（例如「目前有哪個 PR 正在進行」），因為這類資訊很快就會過期、且與文件本身脫鉤。請直接查 `git log`、GitHub 上開啟中的 PR／Issue，或重新檢視 `docs/ai/todolist.md` 現況，取得當下最新狀態，不要假設任何靜態文件描述的狀態仍然成立。
+動態的開發進度（目前有哪個 PR 在進行、已知殘留問題）記在 [`docs/ai/HANDOFF.md`](docs/ai/HANDOFF.md)，不寫在本檔 —— 因為這類資訊很快會過期。但 `HANDOFF.md` 本身也可能過期，若跟 `git log`、GitHub 上開啟中的 PR／Issue 的實際狀態衝突，一律以 `git log`／GitHub 現況為準，不要假設任何靜態文件描述的狀態仍然成立。

@@ -4,6 +4,7 @@
 
 ## `docs/ai/` — AI agent 適用的 canonical 文件（英文撰寫）
 
+- [`HANDOFF.md`](ai/HANDOFF.md) — 最新進度快照（動態內容，寫給接手的下一個 agent）
 - [`requirements.md`](ai/requirements.md) — 需求文件（REQ / AC 逐項驗收標準）
 - [`architecture.md`](ai/architecture.md) — 架構文件（module map、control flow、threading model、error taxonomy、timeout 一覽、CI）
 - [`todolist.md`](ai/todolist.md) — 依優先序（P0～P5）排列的問題追蹤清單／開發 backlog
