@@ -40,10 +40,11 @@
 - **AC-3.6**：成功後所有 part 檔案會依區段順序串接成最終目標檔案（透過 `shutil.copyfileobj` 串流寫入，不會整份讀進記憶體），並刪除暫存 part 檔；目標路徑上若已有舊檔會被覆寫。
 
 ### REQ-4：有界重試與 backoff，而非無限期卡住
-- **AC-4.1**：失敗的區段（非 2xx 狀態碼、網路層例外、或位元組數不符）會以指數 backoff（基準 1 秒、上限 30 秒）重試，最多固定次數（8 次），超過後整個下載會中止並丟出 `ChunkDownloadFailed`，內含區段編號、嘗試次數與最後一次失敗原因。
+- **AC-4.1**：失敗的區段（非 2xx 狀態碼、網路層例外、或位元組數不符）會以指數 backoff（基準 1 秒、上限 30 秒）重試，最多固定次數（8 次），超過後**這一次下載嘗試**會丟出 `ChunkDownloadFailed`，內含區段編號、嘗試次數與最後一次失敗原因。
 - **AC-4.2**：URL 產生階段（任何區塊下載開始前的 captcha／proxy 探測階段）有自己的有界重試：captcha 答錯最多 3 次；同一個 proxy 連續 3 輪拿不到任何新 URL 就換下一個；所有 proxy 都試過仍失敗，會丟出說明「IP／proxy pool 疑似被封鎖」的 `RuntimeError`，而不是卡住不動。
 - **AC-4.3**：本專案發出的每一個對外 HTTP 請求都帶有明確 timeout；沒有任何請求可能因對方主機無回應而無限期阻塞。
 - **AC-4.4**：單一區塊下載 thread 內的失敗，一律經由同一套失敗紀錄流程處理（絕不被靜默吞掉），且絕不會讓該區段的「使用中」旗標卡住 — 否則排程迴圈會永遠卡在該區段上。
+- **AC-4.5**：`ChunkDownloadFailed`（AC-4.1）不會直接讓整個 `download()` 中止：它會被攔截，並自動重跑整個下載（重新解 captcha、重新取得 URL），最多累計 `MAX_DOWNLOAD_RETRIES`（3）次完整嘗試，才會把失敗真正丟給呼叫端。因為每次重跑都會重新查詢 REQ-11 的續傳 manifest，已完成的區段會被跳過而非重新下載，所以一次重試實際上只需要重做真正卡住的那個（或那幾個）區段。取消（`DownloadCancelled`）與其他任何例外類型都不適用這個自動重試，只有 `ChunkDownloadFailed` 會觸發。
 
 ### REQ-5：Captcha 處理
 - **AC-5.1**：在產生任何下載 URL 之前，會先取得 captcha 挑戰並交給呼叫端提供的 `captcha_callback(image_bytes, challenge, captcha_url) -> str`；預設實作（CLI 使用）會開啟圖片並從 stdin 讀取回應。GUI 提供自己的 callback，會透過 Qt signal 往返阻塞背景 worker thread，直到使用者在介面上送出回應。
