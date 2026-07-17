@@ -181,6 +181,16 @@ CHUNK_RETRY_BACKOFF_CAP = 30.0
 # removed, so one that degraded mid-download (or was flaky from the start)
 # kept being preferentially reselected for the rest of the run.
 PROXY_FAILURE_EVICTION_THRESHOLD = 3
+# How many times download() re-attempts the whole download after a chunk
+# permanently exhausts MAX_CHUNK_RETRIES (ChunkDownloadFailed), instead of
+# surfacing the failure to the caller immediately. Each re-attempt goes
+# through _prepare_resume again, so already-completed ranges are skipped,
+# not re-downloaded -- the cost of a retry is just the one (or few) chunks
+# that were actually stuck, not the whole file. A fresh captcha solve is
+# required each time (generate_download_urls always fetches one; captcha
+# automation is explicitly out of scope for this project), so this isn't
+# fully silent, but it removes the need to manually restart the app.
+MAX_DOWNLOAD_RETRIES = 3
 
 
 def _emit_status(callback: StatusCallback, message: str) -> None:
@@ -694,8 +704,52 @@ class Downloader:
             ) from exc
         resolved_name = self._apply_output_dir(self._resolve_filename(filename, original_name), output_dir)
 
-        urls = []
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
+        download_attempt = 0
+        while True:
+            download_attempt += 1
+            urls = self._generate_urls_for_attempt(file_id, threads, captcha_callback)
+
+            redownloaded = False
+            current_split = split_size
+
+            try:
+                while True:
+                    result = self._download_once(urls, resolved_name, len(urls), current_split, file_id=file_id)
+                    if self.stop_event.is_set():
+                        raise DownloadCancelled("Download cancelled")
+
+                    if ensure_media_check and self.should_check_media(resolved_name) and which("ffmpeg"):
+                        if not self._check_media(Path(resolved_name)):
+                            if not redownloaded:
+                                self.log("Video appears corrupted. Retrying with a larger chunk size ...")
+                                redownloaded = True
+                                current_split *= 2
+                                continue
+                            self.log("Video is still corrupted after retry.")
+                    break
+            except ChunkDownloadFailed:
+                if download_attempt >= MAX_DOWNLOAD_RETRIES:
+                    raise
+                self.log(
+                    f"Download attempt {download_attempt}/{MAX_DOWNLOAD_RETRIES} hit an unrecoverable "
+                    "chunk failure; automatically retrying the whole download (already-completed "
+                    "segments are kept and skipped via resume, not re-downloaded) ..."
+                )
+                continue
+
+            return result
+
+    def _generate_urls_for_attempt(
+        self, file_id: str, threads: int, captcha_callback: Optional[CaptchaCallback]
+    ) -> List[str]:
+        """Solve a fresh captcha and fetch up to ``threads`` download URLs.
+
+        Split out of ``download()`` so a whole-download retry (see
+        ``MAX_DOWNLOAD_RETRIES``) can call it again without duplicating the
+        cache-clearing/logging around it.
+        """
         if self.url_cache_path.exists():
             try:
                 self.url_cache_path.unlink()
@@ -719,29 +773,7 @@ class Downloader:
             self.log(
                 f"Only {len(urls)} download URLs available; reducing connections from {threads} to {len(urls)}."
             )
-            threads = len(urls)
-
-        self.tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        redownloaded = False
-        current_split = split_size
-
-        while True:
-            result = self._download_once(urls, resolved_name, threads, current_split, file_id=file_id)
-            if self.stop_event.is_set():
-                raise DownloadCancelled("Download cancelled")
-
-            if ensure_media_check and self.should_check_media(resolved_name) and which("ffmpeg"):
-                if not self._check_media(Path(resolved_name)):
-                    if not redownloaded:
-                        self.log("Video appears corrupted. Retrying with a larger chunk size ...")
-                        redownloaded = True
-                        current_split *= 2
-                        continue
-                    self.log("Video is still corrupted after retry.")
-            break
-
-        return result
+        return urls
 
     def _cache_urls(self, file_id: str, urls: Sequence[str]) -> None:
         if self.url_cache_path.exists():

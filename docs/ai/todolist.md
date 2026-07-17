@@ -162,6 +162,16 @@
     3. 同步更新 `AGENTS.md`／`CONTRIBUTING.md` 的開工閱讀順序，補一句「若需要查閱已完成輪次的歷史脈絡，才去讀 `docs/ai/todolist-archive/`」，避免歸檔後反而漏讀重要的既有決策記錄（例如 P4-2 那段關於 `nonlocal stop` 是否冗餘的分析，之後若要再動 `_download_chunk` 仍有參考價值）。
   - 測試：純文件結構調整，不影響程式碼；驗收方式是歸檔後 `docs/ai/todolist.md` 行數／估計 token 數明顯下降，且逐項核對 archive 內容與原內容一致、沒有遺漏任何一項。
 
+## R2-P7 — 可靠性：單一區段永久失敗不該讓整個下載直接放棄
+
+- [x] **R2-16 `ChunkDownloadFailed` 後自動重跑整個下載（依賴既有續傳機制），不需使用者手動重試**（2026-07-18 使用者實際用打包出的 exe 下載大檔時觸發，立項並當場完成）
+  - **使用者痛點**：實測時某個 chunk 重試 8 次全部透過壞掉的 proxy 逾時，最終整個下載直接失敗中止，訊息只留下「可能被封鎖」的提示；使用者得自己手動重新點「Start download」才能繼續 —— 而且不清楚重新開始是否要整個檔案重下載一次。
+  - **成因分析**：`download()` 原本只有「單一 chunk 最多重試 8 次」（`MAX_CHUNK_RETRIES`）這一層防護；一旦某個 chunk 耗盡這 8 次（可能只是運氣不好連續抽到 8 個爛 proxy，尤其在 R2-10 的降級機制還沒累積足夠資料淘汰壞 proxy 之前），`ChunkDownloadFailed` 會直接從 `download()` 丟出，沒有任何更高層的重試。R2-13 已經做出「以磁碟為準的續傳 manifest」，理論上重新呼叫一次 `download()` 只需要補齊真正卡住的那幾個 chunk，但這件事完全沒有自動化，使用者不知道、也不會主動這樣做。
+  - **實作**：`Downloader.download()` 拆成外層（重試整次下載，新增 `MAX_DOWNLOAD_RETRIES = 3`）＋內層（原本就有的媒體檢查重試）兩層迴圈；`_generate_urls_for_attempt()`（從原本 `download()` 內聯的 URL 產生／captcha 段落抽出）在外層每次重跑都重新呼叫一次，重新解一次 captcha、拿新的一批下載 URL。內層迴圈丟出的 `ChunkDownloadFailed` 被外層 `except` 攔截：未達 `MAX_DOWNLOAD_RETRIES` 就記一則 log 訊息並 `continue`（重跑 `_download_once` 時 `_prepare_resume` 會自動跳過已完成區段，只補真正卡住的部分）；達到上限才把原始例外真正丟給呼叫端。`DownloadCancelled`（含 `stop_event` 被設定、或 URL 產生階段的 `OperationCancelled` 轉換）與其他例外型別完全不觸發這個重試 —— 只有 `ChunkDownloadFailed` 會。
+  - **取捨**：因為每次重跑都要重新解 captcha（`k2s_client.generate_download_urls` 的既有設計就是每次呼叫都要求一次 captcha，captcha 自動化本來就不在本專案範疇內，見 AGENTS.md §1「範疇外」），所以這不是完全靜默的重試 —— GUI 情境下使用者可能會再看到一次 captcha 輸入框。但比起原本「整個下載直接失敗、使用者自己重新點擊」已經省掉大部分手動步驟，且續傳機制保證不會真的整檔重下載。
+  - 測試：`tests/test_downloader_whole_download_retry.py`（5 個：`ChunkDownloadFailed` 觸發自動重試並最終成功、每次重試都重新解 captcha、重試次數耗盡後原例外仍會被丟出、取消不會被重試、非 `ChunkDownloadFailed` 的例外不會被重試）。核心測試套件（153 項）全數通過，`ruff check .` 乾淨。
+  - 文件：`docs/ai/requirements.md`／`docs/human/requirements.md` 新增 AC-4.5、調整 AC-4.1 措辭；`docs/ai/architecture.md`／`docs/human/architecture.md` §2 控制流程圖改成外層/內層兩層迴圈、§5 錯誤分類表補充 `ChunkDownloadFailed` 現在何時才真正丟出、重試/backoff 參數表新增 `MAX_DOWNLOAD_RETRIES`。
+
 ---
 
 ## 建議處理順序
@@ -169,10 +179,10 @@
 > 第一輪（P0 ~ P5）的處理順序與完成紀錄已隨該輪一併封存，見
 > [`todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md) 的「完成紀錄」段落。
 
-第二輪（R2-1 ~ R2-13）：R2-1~R2-9、R2-13 已完成；R2-10 完成第 1~4 點（第 5 點延後、第 6 點不採用）；
-R2-11 部分完成（telemetry 與零成本提示已做，「依數據調整預設」需要真實使用數據才能決定，留待之後）
-（見各項狀態與 PR 連結）。R2-12 仍未認領，建議等 R2-11 的 telemetry 累積到真實使用數據後再決定要採用
-哪個尾端對策；其對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。
+第二輪（R2-1 ~ R2-16）：R2-1~R2-9、R2-13、R2-16 已完成；R2-10 完成第 1~4 點（第 5 點延後、第 6 點不
+採用）；R2-11 部分完成（telemetry 與零成本提示已做，「依數據調整預設」需要真實使用數據才能決定，留待
+之後）（見各項狀態與 PR 連結）。R2-12 仍未認領，建議等 R2-11 的 telemetry 累積到真實使用數據後再決定
+要採用哪個尾端對策；其對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。
 
 **R2-P6（R2-14、R2-15）** 是 2026-07-17 使用者直接提出的兩項流程／文件維護改善（review 留言截斷問題、
 todolist 歸檔機制），與上述 R2-1~R2-13 的程式碼修正屬不同性質；兩項皆已完成（見各項狀態）。本檔（含
