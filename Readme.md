@@ -62,4 +62,4 @@ uv sync --extra dev        # or: pip install -e ".[dev]"
 uv run pytest -q           # run the test suite
 uv run ruff check .        # lint
 ```
-Both checks also run automatically in CI (`.github/workflows/ci.yml`) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing conventions, and the commit-message format used in this repo.
+Both checks also run automatically in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing conventions, and the commit-message format used in this repo.
