@@ -33,6 +33,10 @@ def _load_stylesheet(app: QApplication) -> None:
 
 def main() -> int:  # pragma: no cover - Qt entry
     app = QApplication(sys.argv)
+    # Needed before any QStandardPaths.AppDataLocation lookup (gui/paths.py)
+    # so it resolves to a stable per-app folder instead of a generic one.
+    app.setOrganizationName("K2SDownloaderm")
+    app.setApplicationName("K2SDownloaderm")
     _load_stylesheet(app)
     window = MainWindow()
     icon_path = _resource_path("assets", "icon", "icon.ico")

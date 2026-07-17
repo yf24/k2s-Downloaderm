@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .paths import default_download_dir
 from .worker import DownloadWorker, ProxyLoaderWorker
 from ..core.downloader import human_readable_bytes
 
@@ -105,6 +107,17 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText("Optional override name")
         settings_layout.addWidget(self.filename_edit)
+
+        save_to_row = QHBoxLayout()
+        save_to_row.setSpacing(10)
+        self.output_dir_edit = QLineEdit()
+        self.output_dir_edit.setText(str(default_download_dir()))
+        self.output_dir_edit.setPlaceholderText("Save to folder")
+        self.browse_button = QPushButton("Browse…")
+        self.browse_button.clicked.connect(self._browse_output_dir)
+        save_to_row.addWidget(self.output_dir_edit, 1)
+        save_to_row.addWidget(self.browse_button)
+        settings_layout.addLayout(save_to_row)
 
         controls_grid = QGridLayout()
         controls_grid.setHorizontalSpacing(14)
@@ -350,6 +363,12 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
                 self.resize(self.width(), self._collapsed_height)
             self.dev_toggle.setArrowType(Qt.ArrowType.RightArrow)
 
+    def _browse_output_dir(self) -> None:
+        start_dir = self.output_dir_edit.text().strip() or str(default_download_dir())
+        chosen = QFileDialog.getExistingDirectory(self, "Save to folder", start_dir)
+        if chosen:
+            self.output_dir_edit.setText(chosen)
+
     def start_download(self) -> None:
         if self._worker:
             return
@@ -359,6 +378,7 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
             QMessageBox.warning(self, "Missing URL", "Please enter a k2s download URL.")
             return
 
+        output_dir = self.output_dir_edit.text().strip() or None
         filename = self.filename_edit.text().strip() or None
         threads = self.thread_spin.value()
         split_size = self.split_spin.value() * 1024 * 1024
@@ -376,6 +396,7 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
         worker = DownloadWorker(
             url,
             filename=filename,
+            output_dir=output_dir,
             threads=threads,
             split_size=split_size,
             ensure_media_check=ensure_check,

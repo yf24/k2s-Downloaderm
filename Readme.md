@@ -37,7 +37,7 @@ Alternative:
 ```
 uv run -- python -m k2s_downloader.gui.app
 ```
-Provide the K2S link inside the application, optionally override the output filename, adjust the thread count and split size, then start the download. Captcha prompts appear inline.
+Provide the K2S link inside the application, optionally override the output filename, choose a save-to folder (defaults to your Downloads folder), adjust the thread count and split size, then start the download. Captcha prompts appear inline. In-progress temp files and caches are kept in a per-user app data folder rather than wherever the app happens to be launched from, so they're always writable even when the GUI is installed under `Program Files`.
 
 ## Captcha Handling
 Keep2Share requires solving an image captcha to authorize each download session. Behavior differs slightly by interface:
@@ -62,7 +62,14 @@ uv sync --extra dev        # or: pip install -e ".[dev]"
 uv run pytest -q           # run the test suite
 uv run ruff check .        # lint
 ```
-Both checks also run automatically in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) for every push and pull request. To build a standalone executable, install the optional build extra (`pip install -e ".[build]"`) for PyInstaller. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing conventions, and the commit-message format used in this repo.
+Both checks also run automatically in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) for every push and pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for code style, testing conventions, and the commit-message format used in this repo.
+
+## Building a Windows Executable
+```
+uv sync --extra build          # or: pip install -e ".[build]"
+uv run pyinstaller k2s_gui.spec
+```
+Produces a windowed, onedir build at `dist/K2SDownloaderm/` (run `K2SDownloaderm.exe` from inside that folder). Only the GUI is packaged this way -- the CLI's default captcha handler blocks on stdin, which a windowed app doesn't have; use the CLI directly from a normal Python environment instead. The exe is unsigned, so Windows SmartScreen will show an "unknown publisher" warning on first run; click "More info" -> "Run anyway" to proceed. `ffmpeg` (used only for optional media integrity checks) is not bundled -- install it separately and ensure it's on `PATH` if you want that check to run.
 
 ## Documentation
 This file covers install/usage. Deeper docs are split by audience and live under `docs/`:

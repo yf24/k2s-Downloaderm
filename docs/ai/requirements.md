@@ -76,6 +76,8 @@ A parallel-download client for Keep2Share (`k2s.cc`) file links. Splits a single
 - **AC-10.2**: Progress, status log lines, and proxy-state updates from the background download thread are throttled before reaching the UI thread (a fixed tick interval), so a high thread count does not freeze the UI with excessive signal traffic.
 - **AC-10.3**: A captcha requirement surfaces inline in the GUI (image + text field) rather than blocking on a terminal prompt; submitting unblocks the background download thread.
 - **AC-10.4**: Closing the main window while a download is in progress cancels it and waits (bounded) for the worker thread to stop before the process exits.
+- **AC-10.5**: The GUI exposes an explicit "save to" folder picker (pre-filled with the platform's Downloads folder) controlling where the finished file lands; this is independent of, and does not require touching, the app's own temp/cache location (AC-10.6).
+- **AC-10.6**: The GUI never depends on its process's current working directory being writable — temp files, the URL-cache debug artifact, and the proxy cache all live under a per-user application-data directory resolved at runtime, so the app works correctly when packaged as a standalone Windows executable and launched from a read-only install location (e.g. `Program Files`).
 
 ### REQ-11: Resumable download via an on-disk manifest
 - **AC-11.1**: Every download maintains a resume manifest (`<filename>.manifest.json` under the temp directory) recording the Keep2Share file ID, total size, split size, split count, and each range's completion status; it is refreshed as ranges complete and deleted once the download merges successfully (nothing is left to resume once the file is whole).
@@ -89,7 +91,7 @@ A parallel-download client for Keep2Share (`k2s.cc`) file links. Splits a single
 - **NFR-2 (Concurrency safety)**: shared mutable state touched from multiple chunk-download threads (the working-proxy index list, active-proxy set, progress counters) is protected by dedicated locks; no field is read-modified-written from more than one thread without one.
 - **NFR-3 (Portability)**: `core/` has no GUI-toolkit dependency; it must remain importable and independently testable without PySide6 installed.
 - **NFR-4 (Test coverage)**: every bug fix lands with a regression test under `tests/` that fails against the pre-fix behavior; GUI wiring in `gui/` is the sole documented exception (`# pragma: no cover - GUI wiring`).
-- **NFR-5 (Platform)**: developed and tested on Windows with Python 3.13; `pyproject.toml` declares a floor of Python 3.9 and CI additionally runs on that floor.
+- **NFR-5 (Platform)**: developed and tested on Windows with Python 3.13; `pyproject.toml` declares a floor of Python 3.9 and CI additionally runs on that floor. The GUI can additionally be packaged as a standalone Windows executable via PyInstaller (`k2s_gui.spec`; the `[build]` optional-dependency group) — see "Building a Windows Executable" in [Readme.md](../../Readme.md).
 - **NFR-6 (Bounded chunk memory)**: a chunk's data is streamed straight to its `.partNNN.tmp` file as it arrives (not buffered whole in memory) and flushed after every write so it is visible on disk incrementally, not only once the chunk completes; the rename to its final `.partNNN` name is atomic and only happens once the full expected byte count is confirmed, so an in-progress or crashed attempt can never be mistaken for a complete part.
 
 ## 6. Known Limitations (as of this document)

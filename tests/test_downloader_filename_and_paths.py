@@ -99,6 +99,21 @@ class TestResolveFilenameUserSuppliedName:
         assert Path(resolved) == Path("out/bad_name_.mp4")
 
 
+class TestApplyOutputDir:
+    def test_none_output_dir_leaves_resolved_name_untouched(self):
+        assert Downloader._apply_output_dir("out/video.mp4", None) == "out/video.mp4"
+
+    def test_output_dir_is_joined_with_basename(self, tmp_path):
+        result = Downloader._apply_output_dir("video.mp4", tmp_path / "Downloads")
+        assert Path(result) == tmp_path / "Downloads" / "video.mp4"
+
+    def test_output_dir_strips_any_directory_component_from_resolved_name(self, tmp_path):
+        # A `--filename out/video.mp4`-style directory component must not
+        # escape the caller-chosen output_dir (R2-9's GUI "save to" picker).
+        result = Downloader._apply_output_dir("out/nested/video.mp4", tmp_path / "Downloads")
+        assert Path(result) == tmp_path / "Downloads" / "video.mp4"
+
+
 class TestPartPathStaysFlatUnderTmpDir:
     def test_part_path_uses_only_the_basename(self, tmp_path):
         downloader = Downloader(tmp_dir=tmp_path / "tmp")

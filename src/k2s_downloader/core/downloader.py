@@ -304,6 +304,16 @@ class Downloader:
                 safe_stem = f"{safe_stem}{suffix}"
         return str(user_path.with_name(safe_stem))
 
+    @staticmethod
+    def _apply_output_dir(resolved_name: str, output_dir: Optional[Path | str]) -> str:
+        # GUI-style "save to" directory: takes precedence over any directory
+        # component `resolved_name` may itself carry (that's the CLI's
+        # `--filename out/video.mp4` use case, which never passes
+        # output_dir), so only the final path component survives.
+        if output_dir is None:
+            return resolved_name
+        return str(Path(output_dir) / Path(resolved_name).name)
+
     def log(self, message: str) -> None:
         _emit_status(self.status_callback, message)
 
@@ -587,12 +597,13 @@ class Downloader:
         url: str,
         *,
         filename: Optional[str] = None,
+        output_dir: Optional[Path | str] = None,
         threads: int = 20,
         split_size: int = 20 * 1024 * 1024,
         captcha_callback: Optional[CaptchaCallback] = None,
         ensure_media_check: bool = True,
     ) -> Path:
-        
+
         if split_size < 5 * 1024 * 1024:
             raise ValueError("Split size must be at least 5M")
 
@@ -610,7 +621,7 @@ class Downloader:
             raise RuntimeError(
                 f"Could not fetch file info from Keep2Share (network unreachable or IP blocked): {exc}"
             ) from exc
-        resolved_name = self._resolve_filename(filename, original_name)
+        resolved_name = self._apply_output_dir(self._resolve_filename(filename, original_name), output_dir)
 
         urls = []
 

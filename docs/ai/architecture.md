@@ -15,13 +15,16 @@ src/k2s_downloader/
 └── gui/                  # PySide6 front end. Depends on core/ only through its callback interface.
     ├── app.py              # QApplication bootstrap, stylesheet/icon loading
     ├── main_window.py      # MainWindow: all widgets, signal wiring, UI-thread state
-    └── worker.py           # DownloadWorker / ProxyLoaderWorker: QThread wrappers around core.Downloader
+    ├── worker.py           # DownloadWorker / ProxyLoaderWorker: QThread wrappers around core.Downloader
+    └── paths.py            # app_data_dir() / default_download_dir() via QStandardPaths (R2-9)
 
 k2s_gui_entry.py          # Thin script entry point -> gui.app.main() (for PyInstaller builds)
 tests/                    # Mirrors core/ modules; mocks all `requests` calls; no GUI tests (see NFR-4)
 ```
 
 `core/` is the only package with business logic. `cli.py` and `gui/` are both thin front ends that construct a `Downloader`, wire up callbacks/signals, and otherwise get out of the way.
+
+**File locations** (R2-9): `Downloader`'s `tmp_dir`/`url_cache_path`/`proxy_cache_path` constructor params default to bare relative names (`tmp`, `urls.json`, `proxies.txt`), resolved against the process CWD — fine for the CLI (CWD is wherever the user chose to run it from) but not for a double-clicked GUI exe, whose CWD is the exe's own install directory and may not be writable (e.g. under `Program Files`). `gui/paths.py::app_data_dir()` resolves a per-user writable folder via `QStandardPaths.AppDataLocation` (requires `QApplication.setOrganizationName`/`setApplicationName`, set in `gui/app.py::main()` before any GUI code runs); `gui/worker.py::DownloadWorker.run()`/`ProxyLoaderWorker.run()` pass that folder's `tmp`/`urls.json`/`proxies.txt` subpaths into `Downloader`/`get_working_proxies()` instead of relying on their CWD-relative defaults. Separately, `Downloader.download()` takes an optional `output_dir` (applied via `_apply_output_dir`, joined with only the final path component of the resolved filename — any directory component the filename itself carries is discarded so it can't escape a caller-chosen `output_dir`) so the GUI's "save to" folder picker (`main_window.py`, defaulting to `QStandardPaths.DownloadLocation`) controls where the *finished* file lands, independent of the app-data tmp/cache location above. The CLI never passes `output_dir`, so its existing CWD-relative behavior (including `--filename out/video.mp4`-style directory components, R2-5) is unchanged.
 
 ## 2. Control Flow
 
