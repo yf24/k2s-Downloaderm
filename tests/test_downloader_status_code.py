@@ -32,6 +32,9 @@ class TestChunkStatusCodeHandling:
             url_cache_path=tmp_path / "urls.json",
             block_size=1024,
         )
+        # Normally created by download() before _download_once ever runs;
+        # created here too since these tests call _download_once directly.
+        downloader.tmp_dir.mkdir(parents=True, exist_ok=True)
         # Normally populated by refresh_proxies(); we only need a single
         # "direct connection" (None) entry for this test.
         downloader.proxies = [None]
