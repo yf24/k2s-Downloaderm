@@ -209,13 +209,13 @@
 
 ## R2-P1 — 實際使用必踩的輸入/平台相容性（對 Windows 目標尤其重要）
 
-- [ ] **R2-4 伺服器回傳的檔名未 sanitize → Windows 非法字元使所有 chunk 落地失敗**
+- [x] **R2-4 伺服器回傳的檔名未 sanitize → Windows 非法字元使所有 chunk 落地失敗**（2026-07-17 完成；測試：`tests/test_downloader_filename_and_paths.py::TestSanitizeFilenameComponent`、`TestResolveFilenameSanitizesServerName`、`TestResolveFilenameUserSuppliedName`。實作：新增模組級 `_sanitize_filename_component`（替換非法字元/控制字元、處理保留字裝置名、去除結尾空白與句點、空結果 fallback 成 `"download"`），在 `_resolve_filename` 對 `original_name` 與使用者提供檔名的最終路徑成分（保留原本目錄結構）統一套用。）
   - 位置：`src/k2s_downloader/core/downloader.py`（`_resolve_filename` / part 檔命名 / `_merge_parts`），檔名來源 `k2s_client.get_name`
   - 問題：Keep2Share 回傳的原始檔名可能含 Windows 不允許的字元（`\ / : * ? " < > |`）或保留字（`CON`、`NUL`…）。目前直接拿來組 part 檔與最終檔路徑，在 Windows 上 `write_bytes` 會直接 `OSError` → 被 `_mark_chunk_failed` 當成一般錯誤重試 8 次後丟 `ChunkDownloadFailed`，錯誤訊息還誤導成「IP/proxy 被封鎖」。本專案目標平台就是 Windows（見 AGENTS.md §7），這是高機率實際踩到的問題。
   - 建議做法：新增檔名 sanitize（替換非法字元、處理保留字與結尾空白/句點），在 `_resolve_filename` 統一套用；失敗時錯誤訊息應能區分「本地寫檔失敗」與「網路失敗」。
   - 測試：對含各非法字元/保留字的檔名驗證 sanitize 結果；驗證磁碟寫入失敗不會被誤報成封鎖。
 
-- [ ] **R2-5 `filename` 含目錄成分時 part 檔路徑父目錄不存在 → 全數失敗**
+- [x] **R2-5 `filename` 含目錄成分時 part 檔路徑父目錄不存在 → 全數失敗**（2026-07-17 完成；測試：`tests/test_downloader_filename_and_paths.py::TestPartPathStaysFlatUnderTmpDir`、`TestMergePartsCreatesTargetParentDirectory`。實作：新增 `Downloader._part_path()` 統一以 `Path(filename).name`（不含目錄成分）組出 part 檔路徑，`_download_chunk`／排程重用分支／`_merge_parts` 三處呼叫點皆改用它；`_merge_parts` 寫出最終檔前先 `target_path.parent.mkdir(parents=True, exist_ok=True)`。附帶修正 `tests/test_downloader_status_code.py` 的既有 fixture：該測試直接呼叫 `_download_once` 而略過 `download()` 原本會做的 `tmp_dir.mkdir(...)`，先前靠絕對路徑覆蓋 `tmp_dir` 前綴的巧合才沒有暴露這個缺口，修正後需要顯式建立 `tmp_dir`。）
   - 位置：`src/k2s_downloader/core/downloader.py`（part 檔路徑 `self.tmp_dir / f"{ctx.filename}.partNN"`）
   - 問題：CLI `--filename out/video.mp4` 這類含路徑的值會使 part 檔路徑變成 `tmp/out/video.mp4.partNN`，`tmp_dir.mkdir` 只建立 `tmp/`，寫入時 `FileNotFoundError` → 同 R2-4 的誤導性重試循環。
   - 建議做法：part 檔一律只用 `Path(filename).name` 命名；最終輸出前確認/建立目標父目錄。

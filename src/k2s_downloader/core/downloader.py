@@ -42,6 +42,36 @@ StatusCallback = Optional[Callable[[str], None]]
 ProgressCallback = Optional[Callable[[int, int, int, int], None]]
 CaptchaCallback = k2s_client.CaptchaCallback
 
+# Characters Windows rejects outright in a filename, plus path separators
+# (a filename component must never smuggle in directory structure) and
+# ASCII control characters.
+_WINDOWS_ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Reserved device names on Windows: illegal as a filename regardless of
+# extension (e.g. "con.mp4" is just as unusable as "con").
+_WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
+_WINDOWS_RESERVED_NAMES.update(f"COM{i}" for i in range(1, 10))
+_WINDOWS_RESERVED_NAMES.update(f"LPT{i}" for i in range(1, 10))
+
+
+def _sanitize_filename_component(name: str) -> str:
+    """Make a single filename (no directory separators) safe to use on disk.
+
+    ``name`` may come straight from the Keep2Share API (``k2s_client.get_name``)
+    or from user input, neither of which is guaranteed to be a valid Windows
+    filename: it can contain characters Windows rejects outright, a reserved
+    device name (``CON``, ``NUL``, ``COM1``, ...), or trailing dots/spaces
+    (which Windows silently strips, so the file actually created on disk
+    would not match the name callers think they wrote). Without this,
+    ``Path.write_bytes`` raises a plain ``OSError`` that
+    ``_mark_chunk_failed`` treats like any other chunk failure -- retried 8
+    times with a misleading "IP/proxy may be blocked" error at the end.
+    """
+    sanitized = _WINDOWS_ILLEGAL_CHARS_RE.sub("_", name).strip().rstrip(". ")
+    stem = sanitized.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        sanitized = f"_{sanitized}"
+    return sanitized or "download"
+
 # Timeout (seconds) for the HEAD request used to discover total file size.
 # Previously unset, so a blocked/unresponsive IP would hang here forever.
 HEAD_REQUEST_TIMEOUT = 15
@@ -220,16 +250,42 @@ class Downloader:
 
     @staticmethod
     def _resolve_filename(user_filename: Optional[str], original_name: str) -> str:
+        # original_name is whatever Keep2Share's API returned for this file
+        # (see k2s_client.get_name) -- untrusted input, sanitized the same
+        # way user-supplied names are before it ever reaches the filesystem.
+        safe_original_name = _sanitize_filename_component(original_name)
         if not user_filename:
-            return original_name
-        path = Path(user_filename)
-        if path.suffix:
-            return user_filename
-        suffix = "".join(Path(original_name).suffixes)
-        return f"{user_filename}{suffix}" if suffix else user_filename
+            return safe_original_name
+
+        # `user_filename` may legitimately carry directory components (e.g.
+        # CLI `--filename out/video.mp4`); only its final path component is
+        # a "filename" that needs sanitizing, and it's re-attached under the
+        # original parent directory so the caller's intended output location
+        # is preserved.
+        user_path = Path(user_filename)
+        safe_stem = _sanitize_filename_component(user_path.name)
+        if not user_path.suffix:
+            suffix = "".join(Path(safe_original_name).suffixes)
+            if suffix:
+                safe_stem = f"{safe_stem}{suffix}"
+        return str(user_path.with_name(safe_stem))
 
     def log(self, message: str) -> None:
         _emit_status(self.status_callback, message)
+
+    def _part_path(self, filename: str, idx: object, split_count: int) -> Path:
+        """On-disk path of one chunk's part file, always flat under ``tmp_dir``.
+
+        Keyed off ``Path(filename).name`` rather than ``filename`` itself,
+        so a ``filename`` with directory components (e.g. CLI
+        ``--filename out/video.mp4``) doesn't produce a part path like
+        ``tmp_dir/out/video.mp4.partNN`` -- ``tmp_dir.mkdir()`` only ever
+        creates ``tmp_dir`` itself, so that nested parent would not exist
+        and every chunk write would fail with the same misleading
+        "possibly blocked" retry loop as an unsanitized filename.
+        """
+        basename = Path(filename).name
+        return self.tmp_dir / f"{basename}.part{str(idx).zfill(len(str(split_count)))}"
 
     def _mark_chunk_failed(self, range_meta: Dict[str, object], reason: str) -> None:
         """Record a failed chunk attempt with a bounded retry budget.
@@ -478,7 +534,7 @@ class Downloader:
 
         chunk_range = range_meta["range"]  # type: ignore[index]
         expected_bytes = int(range_meta["bytes"])  # type: ignore[arg-type]
-        tmp_filename = self.tmp_dir / f"{ctx.filename}.part{str(index).zfill(len(str(ctx.split_count)))}"
+        tmp_filename = self._part_path(ctx.filename, index, ctx.split_count)
 
         chunk_start_time = time.time()
         buffer = io.BytesIO()
@@ -656,7 +712,7 @@ class Downloader:
                         # source again immediately.
                         continue
 
-                    part_path = self.tmp_dir / f"{ctx.filename}.part{str(idx).zfill(len(str(ctx.split_count)))}"
+                    part_path = self._part_path(ctx.filename, idx, ctx.split_count)
                     if part_path.exists():
                         existing = part_path.read_bytes()
                         if math.isclose(len(existing), meta["bytes"], abs_tol=1):
@@ -731,13 +787,17 @@ class Downloader:
 
     def _merge_parts(self, ranges: Dict[str, Dict[str, object]], filename: str) -> Path:
         target_path = Path(filename)
+        # filename may carry directory components the caller expects to be
+        # created for them (e.g. CLI --filename out/video.mp4); only
+        # tmp_dir is guaranteed to exist at this point.
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         if target_path.exists():
             target_path.unlink()
 
         split_count = len(ranges)
         with target_path.open("wb") as handle:
             for idx in range(split_count):
-                part_path = self.tmp_dir / f"{filename}.part{str(idx).zfill(len(str(split_count)))}"
+                part_path = self._part_path(filename, idx, split_count)
                 with part_path.open("rb") as chunk:
                     handle.write(chunk.read())
                 part_path.unlink()
