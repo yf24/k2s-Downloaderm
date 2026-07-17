@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import math
 import os
@@ -14,7 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence
 
 import requests
-from shutil import which
+from shutil import copyfileobj, which
 from tqdm import tqdm
 
 from . import k2s_client
@@ -110,6 +109,17 @@ class _DownloadContext:
     threads: int
     split_count: int
     progress_bar: tqdm
+    # The following four fields exist only to let chunk threads and the
+    # scheduling loop's part-reuse branch persist the resume manifest
+    # (see _persist_manifest) without threading extra positional arguments
+    # through _download_chunk's signature. `ranges` is the same dict object
+    # `_run_scheduling_loop` iterates -- mutating a range's "downloaded" flag
+    # in place is visible here too, frozen dataclass notwithstanding (frozen
+    # only blocks rebinding the attribute, not mutating what it points to).
+    file_id: str
+    total_size: int
+    bytes_per_split: int
+    ranges: Dict[str, Dict[str, object]]
 
 
 class FailedChunk(NamedTuple):
@@ -229,6 +239,7 @@ class Downloader:
         self._progress_lock = threading.Lock()
         self._proxy_state_lock = threading.Lock()
         self._working_proxy_lock = threading.Lock()
+        self._manifest_lock = threading.Lock()
         self._bytes_downloaded = 0
         self._total_bytes = 0
         self._ranges_total = 0
@@ -286,6 +297,179 @@ class Downloader:
         """
         basename = Path(filename).name
         return self.tmp_dir / f"{basename}.part{str(idx).zfill(len(str(split_count)))}"
+
+    def _manifest_path(self, filename: str) -> Path:
+        """On-disk path of the resume manifest, flat under ``tmp_dir`` like
+        ``_part_path`` (same reasoning: keyed off the basename only)."""
+        return self.tmp_dir / f"{Path(filename).name}.manifest.json"
+
+    def _load_manifest(self, filename: str) -> Optional[dict]:
+        """Best-effort read of a previous run's manifest for ``filename``.
+
+        Returns ``None`` on anything short of a fully well-formed JSON
+        object -- a missing, partially-written, or corrupt manifest is
+        treated exactly like "no previous progress", never as an error that
+        should abort the (otherwise perfectly startable) download.
+        """
+        manifest_path = self._manifest_path(filename)
+        if not manifest_path.exists():
+            return None
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _persist_manifest(self, ctx: _DownloadContext) -> None:
+        """Write (or refresh) the resume manifest for the current download.
+
+        This is what makes the download's progress visible on disk (the
+        user's original complaint: no growing files, no record of whether
+        anything was actually downloaded) and lets a *later* run tell "my
+        own leftover part files" apart from a stale/foreign set that just
+        happens to share this filename -- see ``_prepare_resume``. Written
+        to a temp file and ``replace()``d into place (atomic overwrite, and
+        Windows-safe -- plain ``rename`` refuses to overwrite an existing
+        destination on Windows).
+
+        Best-effort: a write failure here must never abort or fail an
+        otherwise-successful chunk, so it only logs and moves on.
+        """
+        manifest_path = self._manifest_path(ctx.filename)
+        # Snapshot every range's flags under _progress_lock -- the same lock
+        # _download_chunk's completion path and the scheduling loop's
+        # part-reuse branch hold while flipping "downloaded" -- so this
+        # dict comprehension can't observe some ranges mid-update and
+        # others not (in-memory only, no I/O happens while the lock is
+        # held).
+        with self._progress_lock:
+            ranges_snapshot = {
+                idx: {
+                    "range": meta["range"],
+                    "bytes": meta["bytes"],
+                    "downloaded": bool(meta.get("downloaded")),
+                }
+                for idx, meta in ctx.ranges.items()
+            }
+        payload = {
+            "file_id": ctx.file_id,
+            "total_size": ctx.total_size,
+            "split_size": ctx.bytes_per_split,
+            "split_count": len(ctx.ranges),
+            "ranges": ranges_snapshot,
+            "updated_at": time.time(),
+        }
+        tmp_manifest_path = manifest_path.with_name(manifest_path.name + ".tmp")
+        try:
+            with self._manifest_lock:
+                with tmp_manifest_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+                tmp_manifest_path.replace(manifest_path)
+        except OSError as exc:
+            self.log(f"Could not update resume manifest ({exc}); download continues without it.")
+
+    def _prepare_resume(
+        self,
+        filename: str,
+        file_id: str,
+        total_size: int,
+        bytes_per_split: int,
+        ranges: Dict[str, Dict[str, object]],
+    ) -> None:
+        """Detect and validate resumable progress before the scheduling loop starts.
+
+        A manifest only authorizes resume when its ``file_id``, ``total_size``,
+        and range layout all match this run -- otherwise leftover part files
+        under this filename belong to an unrelated previous download (e.g. a
+        different Keep2Share link that happened to resolve to the same
+        filename) and reusing them by byte-count coincidence alone (the
+        scheduling loop's part-reuse branch has no other way to tell) would
+        silently splice foreign bytes into this file. When the manifest is
+        absent or doesn't match, any stray ``.partNN``/manifest files for
+        this filename are cleared instead of trusted.
+
+        For a range the manifest *does* vouch for, the part file on disk is
+        still independently re-verified (existence + byte count) rather than
+        trusted blindly -- the manifest records intent, the file on disk is
+        the source of truth.
+        """
+        manifest = self._load_manifest(filename)
+        manifest_matches = (
+            manifest is not None
+            and manifest.get("file_id") == file_id
+            and manifest.get("total_size") == total_size
+            and manifest.get("split_size") == bytes_per_split
+            and manifest.get("split_count") == len(ranges)
+        )
+
+        if not manifest_matches:
+            removed_any = self._clear_stale_part_files(filename)
+            if removed_any:
+                self.log(
+                    "Found leftover temporary files for this filename from an "
+                    "unrelated or incompatible previous download; clearing them "
+                    "before starting fresh."
+                )
+            self.log("No previous progress found; starting a fresh download.")
+            return
+
+        manifest_ranges = manifest.get("ranges", {})
+        resumed_count = 0
+        resumed_bytes = 0
+        for idx, meta in ranges.items():
+            if not manifest_ranges.get(idx, {}).get("downloaded"):
+                continue
+            part_path = self._part_path(filename, idx, len(ranges))
+            if not part_path.exists():
+                continue
+            if not math.isclose(part_path.stat().st_size, meta["bytes"], abs_tol=1):
+                continue
+            meta["downloaded"] = True
+            resumed_count += 1
+            resumed_bytes += int(meta["bytes"])
+
+        if resumed_count:
+            self.log(
+                f"Resuming: found {resumed_count}/{len(ranges)} segment(s) already "
+                f"downloaded ({human_readable_bytes(resumed_bytes)}); continuing."
+            )
+            self._bytes_downloaded += resumed_bytes
+            self._done_count += resumed_count
+        else:
+            self.log("No previous progress found; starting a fresh download.")
+
+    def _clear_stale_part_files(self, filename: str) -> bool:
+        """Remove any part/manifest files for ``filename`` that a mismatched
+        or missing manifest means we can no longer trust. Returns whether
+        anything was actually removed (purely for logging)."""
+        if not self.tmp_dir.exists():
+            return False
+        basename = Path(filename).name
+        # Match only this app's own part-file naming (".partN" / ".partN.tmp",
+        # any digit width -- a stale set from a different split layout can
+        # be padded to a different width than the current run's) rather
+        # than a bare "*" glob, since this loop deletes what it matches and
+        # a wildcard suffix would also sweep up anything else that merely
+        # starts with the same prefix.
+        part_name_pattern = re.compile(rf"^{re.escape(basename)}\.part\d+(?:\.tmp)?$")
+        removed = False
+        for stale_path in self.tmp_dir.iterdir():
+            if not part_name_pattern.match(stale_path.name):
+                continue
+            try:
+                stale_path.unlink()
+                removed = True
+            except OSError:
+                pass
+        manifest_path = self._manifest_path(filename)
+        if manifest_path.exists():
+            try:
+                manifest_path.unlink()
+                removed = True
+            except OSError:
+                pass
+        return removed
 
     def _mark_chunk_failed(self, range_meta: Dict[str, object], reason: str) -> None:
         """Record a failed chunk attempt with a bounded retry budget.
@@ -438,7 +622,7 @@ class Downloader:
         current_split = split_size
 
         while True:
-            result = self._download_once(urls, resolved_name, threads, current_split)
+            result = self._download_once(urls, resolved_name, threads, current_split, file_id=file_id)
             if self.stop_event.is_set():
                 raise DownloadCancelled("Download cancelled")
 
@@ -535,9 +719,20 @@ class Downloader:
         chunk_range = range_meta["range"]  # type: ignore[index]
         expected_bytes = int(range_meta["bytes"])  # type: ignore[arg-type]
         tmp_filename = self._part_path(ctx.filename, index, ctx.split_count)
+        # Downloaded to this in-progress name first, atomically renamed to
+        # tmp_filename only once the full expected byte count is confirmed
+        # on disk. Two things this buys over the old "buffer the whole
+        # chunk in RAM, write it out in one shot at the end" approach: (1)
+        # an in-progress chunk is now visible growing on disk instead of
+        # invisible until 100% done (R2-7/R2-13's original motivation --
+        # users had no way to tell whether anything was happening at all),
+        # and (2) the atomic rename means the scheduling loop's part-reuse
+        # branch (which only ever looks at tmp_filename, never *.tmp) can
+        # never mistake a half-written attempt for a complete one.
+        tmp_write_path = tmp_filename.with_name(tmp_filename.name + ".tmp")
+        bytes_written = 0
 
         chunk_start_time = time.time()
-        buffer = io.BytesIO()
 
         added_to_active = False
         proxy_idx_or_none = self._acquire_proxy_lock()
@@ -584,14 +779,23 @@ class Downloader:
                     )
                     return
 
-                for data in response.iter_content(self.block_size):
-                    if self.stop_event.is_set():
-                        break
-                    if chunk_start_time + CHUNK_STALL_TIMEOUT < time.time():
-                        break
-                    chunk_start_time = time.time()
-                    buffer.write(data)
-                    self._report_progress(len(data), ctx)
+                with tmp_write_path.open("wb") as part_file:
+                    for data in response.iter_content(self.block_size):
+                        if self.stop_event.is_set():
+                            break
+                        if chunk_start_time + CHUNK_STALL_TIMEOUT < time.time():
+                            break
+                        chunk_start_time = time.time()
+                        part_file.write(data)
+                        # Without this, the write sits in Python's internal
+                        # buffer and the .tmp file can appear empty/stale to
+                        # anything else looking at it (a user checking the
+                        # temp folder, another process) until the buffer
+                        # happens to fill or the file is closed -- defeating
+                        # the whole point of streaming to disk incrementally.
+                        part_file.flush()
+                        bytes_written += len(data)
+                        self._report_progress(len(data), ctx)
             except requests.exceptions.RequestException as exc:
                 # Network-level failure (connection error, read timeout,
                 # a chunked-encoding error mid-stream, etc.). Previously
@@ -599,17 +803,18 @@ class Downloader:
                 # this entirely, so the only visible symptom was a
                 # coincidental "size mismatch" below with no indication
                 # of *why* the request actually failed.
+                tmp_write_path.unlink(missing_ok=True)
                 self._mark_chunk_failed(
                     range_meta,
                     f"request error via proxy {proxy_value or 'LOCAL'}: {exc}",
                 )
                 return
 
-            chunk_bytes = len(buffer.getvalue())
-            if not math.isclose(chunk_bytes, expected_bytes, abs_tol=1):
-                self._report_progress(-chunk_bytes, ctx)
+            if not math.isclose(bytes_written, expected_bytes, abs_tol=1):
+                self._report_progress(-bytes_written, ctx)
+                tmp_write_path.unlink(missing_ok=True)
                 self._mark_chunk_failed(
-                    range_meta, f"size mismatch: got {chunk_bytes} expected {expected_bytes}"
+                    range_meta, f"size mismatch: got {bytes_written} expected {expected_bytes}"
                 )
                 # Do NOT release url_locks[thread_index] here: the ``finally``
                 # below is the single release point. Releasing early meant the
@@ -620,7 +825,7 @@ class Downloader:
                 return
 
             range_meta.pop("last_error", None)
-            tmp_filename.write_bytes(buffer.getvalue())
+            tmp_write_path.replace(tmp_filename)
             with self._working_proxy_lock:
                 is_newly_known = proxy_idx not in self.working_proxy_indexes
                 if is_newly_known:
@@ -640,6 +845,7 @@ class Downloader:
                 range_meta["inUse"] = False
                 self._done_count += 1
                 done = self._done_count
+            self._persist_manifest(ctx)
             if not ctx.progress_bar.disable:
                 ctx.progress_bar.desc = f"[{done}/{self._ranges_total}] Downloaded"
             if self.progress_callback:
@@ -650,6 +856,7 @@ class Downloader:
             # Anything unexpected past the request/streaming stage (e.g. a
             # disk write failure) is recorded the same way a network
             # failure is, instead of the old blanket suppress-and-ignore.
+            tmp_write_path.unlink(missing_ok=True)
             self._mark_chunk_failed(
                 range_meta, f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}"
             )
@@ -714,8 +921,14 @@ class Downloader:
 
                     part_path = self._part_path(ctx.filename, idx, ctx.split_count)
                     if part_path.exists():
-                        existing = part_path.read_bytes()
-                        if math.isclose(len(existing), meta["bytes"], abs_tol=1):
+                        # stat() only, not read_bytes() -- this branch fires
+                        # once per pending range per poll tick, and reading
+                        # a whole (potentially 20+MiB) part file into memory
+                        # just to check its length is exactly the kind of
+                        # needless buffering R2-7 removed from the download
+                        # path itself.
+                        existing_size = part_path.stat().st_size
+                        if math.isclose(existing_size, meta["bytes"], abs_tol=1):
                             # Claim the range under _progress_lock so this
                             # check-and-mark cannot interleave with the chunk
                             # thread's own completion publish (which holds the
@@ -728,6 +941,7 @@ class Downloader:
                                     done = self._done_count
                             if claimed:
                                 self._report_progress(int(meta["bytes"]), ctx)
+                                self._persist_manifest(ctx)
                                 if not ctx.progress_bar.disable:
                                     ctx.progress_bar.desc = f"[{done}/{len(ranges)}] Downloaded"
                             # Either way the part is complete on disk; never
@@ -799,8 +1013,18 @@ class Downloader:
             for idx in range(split_count):
                 part_path = self._part_path(filename, idx, split_count)
                 with part_path.open("rb") as chunk:
-                    handle.write(chunk.read())
+                    # copyfileobj streams in fixed-size blocks rather than
+                    # chunk.read()'s old one-shot whole-file read, so merging
+                    # doesn't hold a second full part in memory on top of
+                    # whatever's already buffered for the output handle.
+                    copyfileobj(chunk, handle)
                 part_path.unlink()
+
+        # Resume manifest's job ends at a successful merge -- every part it
+        # was tracking has just been consumed above, so nothing is left to
+        # resume and keeping it around would only wrongly vouch for a
+        # *future* unrelated download that happens to reuse this filename.
+        self._manifest_path(filename).unlink(missing_ok=True)
 
         self.log(f"Finished writing {filename}")
         self.log(f"File Size: {human_readable_bytes(target_path.stat().st_size)}")
@@ -812,6 +1036,7 @@ class Downloader:
         filename: str,
         threads: int,
         bytes_per_split: int,
+        file_id: str = "",
     ) -> Path:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"
@@ -825,6 +1050,14 @@ class Downloader:
         ranges = self._build_ranges(total_size, split_count)
         self._ranges_total = len(ranges)
         self.url_locks = [threading.Lock() for _ in range(threads)]
+
+        # Must run before dispatching any chunk: it decides, per range,
+        # whether an on-disk part file from a previous attempt is safe to
+        # keep (matching manifest) or must be cleared as stale/foreign
+        # (mismatched or absent manifest) -- see _prepare_resume's
+        # docstring. This also updates self._bytes_downloaded/_done_count
+        # for whatever it finds already complete.
+        self._prepare_resume(filename, file_id, total_size, bytes_per_split, ranges)
 
         ctx = _DownloadContext(
             urls=urls,
@@ -840,7 +1073,15 @@ class Downloader:
                 unit_divisor=1024,
                 disable=not self.show_console_progress,
             ),
+            file_id=file_id,
+            total_size=total_size,
+            bytes_per_split=bytes_per_split,
+            ranges=ranges,
         )
+        if self._done_count:
+            ctx.progress_bar.update(self._bytes_downloaded)
+            ctx.progress_bar.desc = f"[{self._done_count}/{len(ranges)}] Downloaded"
+        self._persist_manifest(ctx)
 
         try:
             failed_chunk = self._run_scheduling_loop(ranges, ctx)

@@ -37,13 +37,16 @@ def _make_downloader(tmp_path):
         url_cache_path=tmp_path / "urls.json",
         block_size=1024,
     )
+    # Normally created by download() before _download_once/_download_chunk
+    # ever run; created here too since these tests call them directly.
+    downloader.tmp_dir.mkdir(parents=True, exist_ok=True)
     downloader.proxies = [None]
     downloader.proxy_locks = [threading.Lock()]
     downloader.working_proxy_indexes = []
     return downloader
 
 
-def _make_context(urls, filename, *, threads=1, split_count=1):
+def _make_context(urls, filename, *, threads=1, split_count=1, ranges=None):
     return _DownloadContext(
         urls=urls,
         filename=filename,
@@ -51,6 +54,10 @@ def _make_context(urls, filename, *, threads=1, split_count=1):
         threads=threads,
         split_count=split_count,
         progress_bar=tqdm(total=1, disable=True),
+        file_id="test-file-id",
+        total_size=0,
+        bytes_per_split=0,
+        ranges=ranges if ranges is not None else {},
     )
 
 
@@ -71,7 +78,6 @@ class TestCompletionPublishOrder:
 
     def test_downloaded_set_before_in_use_cleared_and_under_lock(self, tmp_path):
         downloader = _make_downloader(tmp_path)
-        downloader.tmp_dir.mkdir(parents=True)
         events = []
 
         # _download_chunk swallows exceptions from its try block by design
@@ -130,7 +136,6 @@ class TestUrlLockSingleRelease:
 
     def test_size_mismatch_releases_url_lock_exactly_once(self, tmp_path):
         downloader = _make_downloader(tmp_path)
-        downloader.tmp_dir.mkdir(parents=True)
 
         lock = self.InstrumentedLock()
         downloader.url_locks = [lock]

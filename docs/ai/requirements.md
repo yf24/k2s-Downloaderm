@@ -8,9 +8,9 @@ A parallel-download client for Keep2Share (`k2s.cc`) file links. Splits a single
 
 ## 2. Scope
 
-**In scope**: downloading a single Keep2Share file per invocation given its share URL; captcha-gated authorization against Keep2Share's public API; parallel chunked transfer with retry/backoff; optional proxy pool for IP diversity; optional post-download media-integrity check via `ffmpeg`.
+**In scope**: downloading a single Keep2Share file per invocation given its share URL; captcha-gated authorization against Keep2Share's public API; parallel chunked transfer with retry/backoff; optional proxy pool for IP diversity; optional post-download media-integrity check via `ffmpeg`; resuming an interrupted download — whether within the same process or after a restart — when its temp directory (part files plus a matching resume manifest) is still on disk (see REQ-11).
 
-**Out of scope**: batch/queue downloading of multiple URLs in one run; account-based (non-free) Keep2Share access tiers; resuming a download across separate process invocations without the on-disk `.partNNN` files already present; any Keep2Share upload functionality; bypassing or automating captcha solving (the tool surfaces the captcha to the user/caller — see REQ-5).
+**Out of scope**: batch/queue downloading of multiple URLs in one run; account-based (non-free) Keep2Share access tiers; resuming a download whose temp directory was deleted or never populated (there is nothing on disk to resume from); any Keep2Share upload functionality; bypassing or automating captcha solving (the tool surfaces the captcha to the user/caller — see REQ-5).
 
 ## 3. Actors
 
@@ -36,8 +36,8 @@ A parallel-download client for Keep2Share (`k2s.cc`) file links. Splits a single
 - **AC-3.2**: Up to `threads` ranges download concurrently, each in its own thread, gated by a fixed-size pool of per-thread "url locks".
 - **AC-3.3**: `split_size` must be at least 5 MiB; a smaller value raises `ValueError` before any download starts.
 - **AC-3.4**: A range whose downloaded byte count doesn't match its expected size (within 1 byte) is treated as failed and retried, not silently accepted.
-- **AC-3.5**: An already-downloaded `.partNNN` file on disk whose size matches the expected range size is reused without re-downloading (crash/restart resilience within a single `download()` call's temp directory).
-- **AC-3.6**: On success, all part files are concatenated in range order into the final target file and the temp part files are deleted; a pre-existing file at the target path is overwritten.
+- **AC-3.5**: An already-downloaded `.partNNN` file on disk whose size matches the expected range size is reused without re-downloading. This is the low-level mechanism that performs a resume; REQ-11 governs when it is safe to trust (same-run retries always are — a fresh process attempt is only gated in via a matching resume manifest).
+- **AC-3.6**: On success, all part files are concatenated in range order into the final target file (streamed via `shutil.copyfileobj`, not read fully into memory) and the temp part files are deleted; a pre-existing file at the target path is overwritten.
 
 ### REQ-4: Bounded retry with backoff, not indefinite hangs
 - **AC-4.1**: A chunk that fails (non-2xx HTTP status, network-level exception, or a byte-count mismatch) is retried with exponential backoff (base 1s, capped at 30s) up to a fixed maximum attempt count (8), after which the whole download aborts with a `ChunkDownloadFailed` naming the range, attempt count, and last recorded failure reason.
@@ -77,6 +77,12 @@ A parallel-download client for Keep2Share (`k2s.cc`) file links. Splits a single
 - **AC-10.3**: A captcha requirement surfaces inline in the GUI (image + text field) rather than blocking on a terminal prompt; submitting unblocks the background download thread.
 - **AC-10.4**: Closing the main window while a download is in progress cancels it and waits (bounded) for the worker thread to stop before the process exits.
 
+### REQ-11: Resumable download via an on-disk manifest
+- **AC-11.1**: Every download maintains a resume manifest (`<filename>.manifest.json` under the temp directory) recording the Keep2Share file ID, total size, split size, split count, and each range's completion status; it is refreshed as ranges complete and deleted once the download merges successfully (nothing is left to resume once the file is whole).
+- **AC-11.2**: Starting a download whose temp directory already holds a manifest matching this run's file ID, total size, and split layout resumes: previously-completed ranges are skipped without a new network request — but only after independently re-verifying the corresponding part file still exists on disk with the expected byte count (the manifest records intent, the file on disk is the source of truth) — and a status message reports how many ranges/bytes were already there.
+- **AC-11.3**: A missing manifest, or one whose file ID/total size/split layout doesn't match the current run, is never used to justify reusing leftover part files that merely happen to share this filename's byte counts (e.g. a different Keep2Share link that resolves to the same output filename); any such leftover part/manifest files are cleared instead, and the download starts fresh.
+- **AC-11.4**: A cancelled or permanently-failed download leaves its manifest and completed part files in place for a future resume attempt; only a fully successful merge removes them.
+
 ## 5. Non-Functional Requirements
 
 - **NFR-1 (Timeouts)**: every outbound network call has an explicit, named timeout constant (see `architecture.md` § Timeout inventory); none rely on library defaults.
@@ -84,6 +90,7 @@ A parallel-download client for Keep2Share (`k2s.cc`) file links. Splits a single
 - **NFR-3 (Portability)**: `core/` has no GUI-toolkit dependency; it must remain importable and independently testable without PySide6 installed.
 - **NFR-4 (Test coverage)**: every bug fix lands with a regression test under `tests/` that fails against the pre-fix behavior; GUI wiring in `gui/` is the sole documented exception (`# pragma: no cover - GUI wiring`).
 - **NFR-5 (Platform)**: developed and tested on Windows with Python 3.13; `pyproject.toml` declares a floor of Python 3.9 and CI additionally runs on that floor.
+- **NFR-6 (Bounded chunk memory)**: a chunk's data is streamed straight to its `.partNNN.tmp` file as it arrives (not buffered whole in memory) and flushed after every write so it is visible on disk incrementally, not only once the chunk completes; the rename to its final `.partNNN` name is atomic and only happens once the full expected byte count is confirmed, so an in-progress or crashed attempt can never be mistaken for a complete part.
 
 ## 6. Known Limitations (as of this document)
 
