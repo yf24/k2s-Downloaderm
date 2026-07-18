@@ -26,9 +26,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .paths import default_download_dir
+from .paths import app_data_dir, default_download_dir
 from .worker import DownloadWorker, ProxyLoaderWorker
-from ..core.downloader import human_readable_bytes
+from ..core.downloader import Downloader, human_readable_bytes
 
 
 class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
@@ -102,7 +102,14 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://k2s.cc/file/xxxx")
+        self.url_edit.editingFinished.connect(self._check_resume_progress)
         settings_layout.addWidget(self.url_edit)
+
+        self.resume_hint_label = QLabel()
+        self.resume_hint_label.setObjectName("HintLabel")
+        self.resume_hint_label.setWordWrap(True)
+        self.resume_hint_label.setVisible(False)
+        settings_layout.addWidget(self.resume_hint_label)
 
         self.filename_edit = QLineEdit()
         self.filename_edit.setPlaceholderText("Optional override name")
@@ -369,6 +376,33 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
         if chosen:
             self.output_dir_edit.setText(chosen)
 
+    def _check_resume_progress(self) -> None:
+        # Best-effort, local-only check (no network call): a manifest from
+        # a previous interrupted download is matched purely by the file ID
+        # extracted from the URL, so this works even before the server has
+        # told us the file's actual name.
+        url = self.url_edit.text().strip()
+        if not url:
+            self.resume_hint_label.setVisible(False)
+            return
+        try:
+            file_id = Downloader.extract_file_id(url)
+        except ValueError:
+            self.resume_hint_label.setVisible(False)
+            return
+
+        progress = Downloader.find_resume_progress(app_data_dir() / "tmp", file_id)
+        if progress is None:
+            self.resume_hint_label.setVisible(False)
+            return
+
+        self.resume_hint_label.setText(
+            f"Previous progress found: {progress.percent:.1f}% "
+            f"({human_readable_bytes(progress.downloaded_bytes)} / {human_readable_bytes(progress.total_size)}) "
+            f"of \"{progress.filename}\" -- starting this download will resume from there."
+        )
+        self.resume_hint_label.setVisible(True)
+
     def start_download(self) -> None:
         if self._worker:
             return
@@ -377,6 +411,8 @@ class MainWindow(QMainWindow):  # pragma: no cover - GUI wiring
         if not url:
             QMessageBox.warning(self, "Missing URL", "Please enter a k2s download URL.")
             return
+
+        self.resume_hint_label.setVisible(False)
 
         output_dir = self.output_dir_edit.text().strip() or None
         filename = self.filename_edit.text().strip() or None

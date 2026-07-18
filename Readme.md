@@ -37,7 +37,7 @@ Alternative:
 ```
 uv run -- python -m k2s_downloader.gui.app
 ```
-Provide the K2S link inside the application, optionally override the output filename, choose a save-to folder (defaults to your Downloads folder), adjust the thread count and split size, then start the download. Captcha prompts appear inline. In-progress temp files and caches are kept in a per-user app data folder rather than wherever the app happens to be launched from, so they're always writable even when the GUI is installed under `Program Files`.
+Provide the K2S link inside the application, optionally override the output filename, choose a save-to folder (defaults to your Downloads folder), adjust the thread count and split size, then start the download. Captcha prompts appear inline. In-progress temp files and caches are kept in a per-user app data folder rather than wherever the app happens to be launched from, so they're always writable even when the GUI is installed under `Program Files`. If you paste in a link you've downloaded (or partially downloaded) before, a hint appears showing how far you got last time, before you even press "Start download" — starting it will resume from there rather than starting over.
 
 ## Captcha Handling
 Keep2Share requires solving an image captcha to authorize each download session. Behavior differs slightly by interface:
