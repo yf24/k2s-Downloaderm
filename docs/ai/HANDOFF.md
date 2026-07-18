@@ -4,6 +4,7 @@
 
 ## 現況（2026-07-18）
 
+- **R2-17（下載開始前先預覽上次進度）2026-07-18 使用者提出並完成**：新增 `Downloader.find_resume_progress(tmp_dir, file_id)`（純本機掃描 `*.manifest.json`，不打網路），GUI 的 `url_edit` 在 `editingFinished` 時觸發查詢，若有相符的續傳 manifest 就顯示上次完成百分比／位元組數，找不到則隱藏。細節見 `docs/ai/todolist.md` R2-17 項。
 - **R2-16 立項、實作、實測後當天推翻重做（2026-07-18）**：原始版本是「`ChunkDownloadFailed` 後自動重跑整個下載」（外層迴圈＋`MAX_DOWNLOAD_RETRIES=3`＋重新解 captcha）。使用者實際用打包出的 exe 測試後回報體驗明顯變差 —— 每次自動重試都要重新輸入 captcha，且 `generate_download_urls` 要重新掃過 R2-10 後又大又混雜死 proxy 的整個候選清單，反而比原本「失敗就整個中止」更難不看著跑完。**已改用**：完全還原 `download()` 為單層迴圈（移除外層重試、`_generate_urls_for_attempt`、`MAX_DOWNLOAD_RETRIES`），改成把 `MAX_CHUNK_RETRIES` 從 8 調高到 25 —— 讓同一個 chunk 在不需要新 captcha、不需要重新掃 proxy 清單的前提下，於同一個 session 內有更多機會換到能用的連線。細節與教訓見 `docs/ai/todolist.md` R2-16 項（特別留意其中「給下一個 agent 的教訓」段落）。
 - **R2-10（proxy pool 品質改善）2026-07-18 完成第 1~4 點**（第 5 點使用者自備清單延後、第 6 點非 proxy 替代方案評估過不採用）：`proxy.py` 改多來源並行抓取（proxyscrape v2 + 3 個 GitHub raw 清單）、驗證目標從 `api.myip.com` 改對 `k2s.cc` 發 HEAD 且檢查 status code、`proxies.txt` 快取加 12 小時 TTL；`downloader.py` 新增連續失敗自動降級機制（`_note_proxy_failure`，閾值 3 次，direct 連線豁免）。本 session 在真實網路環境下實測過：4 個來源皆可連線、對 300 個候選跑一次真實 refresh 有 47 個通過 k2s.cc 驗證。細節見 `docs/ai/todolist.md` R2-10 項。**起因**：使用者實際用打包出的 exe 下載時貼出真實 log，內含大量 proxy timeout/連線被重置/502/503，直接印證了這個項目的必要性。
 - **`_mark_chunk_failed` 訊息截斷長 query string（附帶修正，非正式編號）2026-07-17 完成並 merge**（[PR #18](https://github.com/yf24/k2s-Downloaderm/pull/18)）：chunk 失敗訊息會把完整的 K2S 簽名下載 URL（`temp_url_sig` 等）印進 log，40 字元以上的 query string 現在會被截斷成 `?<truncated>`，避免洗版與意外洩漏有時效性的簽名連結。

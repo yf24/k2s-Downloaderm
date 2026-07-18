@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from k2s_downloader.core import downloader as downloader_module
-from k2s_downloader.core.downloader import ChunkDownloadFailed, Downloader
+from k2s_downloader.core.downloader import ChunkDownloadFailed, Downloader, ResumeProgress
 
 
 def _make_downloader(tmp_path):
@@ -387,3 +387,94 @@ class TestResumeManifest:
 
         assert requested_ranges == ["bytes=0-4", "bytes=5-9"]
         assert result_path.read_bytes() == total_body
+
+
+class TestFindResumeProgress:
+    """Tests for the GUI "previous progress" preview: a lookup by file_id
+    (extractable from the URL alone, no API call) that scans tmp_dir for a
+    matching manifest, so the GUI can show "you're already 65% through this
+    file" before a download is even started."""
+
+    def test_returns_none_when_tmp_dir_does_not_exist(self, tmp_path):
+        assert Downloader.find_resume_progress(tmp_path / "does-not-exist", "file-abc") is None
+
+    def test_returns_none_when_no_manifest_matches_file_id(self, tmp_path):
+        tmp_dir = tmp_path / "tmp"
+        tmp_dir.mkdir()
+        (tmp_dir / "out.bin.manifest.json").write_text(json.dumps({
+            "file_id": "other-file",
+            "total_size": 10,
+            "ranges": {"0": {"range": "0-4", "bytes": 5, "downloaded": True}},
+        }))
+
+        assert Downloader.find_resume_progress(tmp_dir, "file-abc") is None
+
+    def test_finds_matching_manifest_and_computes_percent(self, tmp_path):
+        tmp_dir = tmp_path / "tmp"
+        tmp_dir.mkdir()
+        (tmp_dir / "My Video.mp4.manifest.json").write_text(json.dumps({
+            "file_id": "file-abc",
+            "total_size": 100,
+            "split_size": 50,
+            "split_count": 2,
+            "ranges": {
+                "0": {"range": "0-49", "bytes": 50, "downloaded": True},
+                "1": {"range": "50-99", "bytes": 50, "downloaded": False},
+            },
+        }))
+
+        result = Downloader.find_resume_progress(tmp_dir, "file-abc")
+
+        assert result == ResumeProgress(
+            filename="My Video.mp4", downloaded_bytes=50, total_size=100, percent=50.0
+        )
+
+    def test_ignores_corrupt_manifest_files(self, tmp_path):
+        tmp_dir = tmp_path / "tmp"
+        tmp_dir.mkdir()
+        (tmp_dir / "out.bin.manifest.json").write_text("not json{{{")
+
+        assert Downloader.find_resume_progress(tmp_dir, "file-abc") is None
+
+    def test_ignores_manifest_missing_required_fields(self, tmp_path):
+        tmp_dir = tmp_path / "tmp"
+        tmp_dir.mkdir()
+        (tmp_dir / "out.bin.manifest.json").write_text(json.dumps({"file_id": "file-abc"}))
+
+        assert Downloader.find_resume_progress(tmp_dir, "file-abc") is None
+
+    def test_real_manifest_written_by_a_download_is_found(self, tmp_path):
+        # End-to-end: exercise the real manifest-writing path (not a
+        # hand-built fixture) to make sure the schema _persist_manifest
+        # writes is exactly what find_resume_progress expects.
+        downloader = _make_downloader(tmp_path)
+        total_body = b"HELLOWORLD"
+
+        def get_side_effect(*args, **kwargs):
+            range_header = kwargs["headers"]["Range"]
+            if range_header == "bytes=0-4":
+                return _response(200, lambda block_size: iter([total_body[0:5]]))
+            return _response(403, lambda block_size: iter([]))
+
+        with patch.object(downloader_module, "MAX_CHUNK_RETRIES", 1), patch(
+            "k2s_downloader.core.downloader.requests.head",
+            return_value=_head(len(total_body)),
+        ), patch(
+            "k2s_downloader.core.downloader.requests.get",
+            side_effect=get_side_effect,
+        ):
+            with pytest.raises(ChunkDownloadFailed):
+                downloader._download_once(
+                    ["https://example.com/f"],
+                    str(tmp_path / "out.bin"),
+                    threads=1,
+                    bytes_per_split=5,
+                    file_id="file-abc",
+                )
+
+        result = Downloader.find_resume_progress(downloader.tmp_dir, "file-abc")
+
+        assert result.filename == "out.bin"
+        assert result.downloaded_bytes == 5
+        assert result.total_size == 10
+        assert result.percent == 50.0

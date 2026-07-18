@@ -57,6 +57,8 @@ CLI/GUI
 
 `download()` is the only public entry point front ends call. Everything under `_download_once` is private to `Downloader` and exists to keep that method itself short — see § 5.
 
+**Previewing resume progress before starting** (R2-17): `Downloader.find_resume_progress(tmp_dir, file_id)` (a `staticmethod`, unlike `_prepare_resume` above which is instance-only and runs inside an actual download) scans `tmp_dir` for a `*.manifest.json` whose recorded `file_id` matches, without needing the resolved filename in advance — `extract_file_id(url)` is a pure regex match, so this whole lookup needs no network call. `gui/main_window.py` wires this to `url_edit`'s `editingFinished` signal so pasting a previously-interrupted download's URL shows its completion percentage immediately, before the user even presses "Start download". Unlike `_prepare_resume`, this is a preview only — it trusts the manifest's own byte counts and does not re-verify against on-disk part files, since a wrong guess here just means a slightly-off percentage in a hint label, not a corrupted merge.
+
 ## 3. Threading & Concurrency Model
 
 `Downloader` runs its own scheduling loop on the calling thread (blocking `download()` until the file is complete, cancelled, or failed) and spawns one short-lived `threading.Thread` per in-flight chunk, up to `threads` concurrently. There is no thread pool; threads are created and left to finish/exit on their own (`daemon=True`), gated by acquiring one of a fixed set of `url_locks` before starting.

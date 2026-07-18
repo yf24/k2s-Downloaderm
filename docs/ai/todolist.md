@@ -173,6 +173,13 @@
   - 文件：`docs/ai/requirements.md`／`docs/human/requirements.md` 的 AC-4.5 已移除、AC-4.1 改回描述單次下載中止並補充「為何不做整個下載層級的自動重試」；`docs/ai/architecture.md`／`docs/human/architecture.md` §2 控制流程圖還原成單層迴圈、§5 錯誤分類表與重試/backoff 參數表更新為 `MAX_CHUNK_RETRIES = 25`（移除 `MAX_DOWNLOAD_RETRIES` 條目）。
   - **給下一個 agent 的教訓**：這是一個「看起來合理但實測後被證明方向錯誤」的案例——加自動重試前，務必想清楚重試單位的成本（這裡的成本是「使用者互動」和「掃過整個 proxy 清單」），而不是只看「使用者不用手動重試」這個表面的好處。之後如果又有類似「下載失敗希望自動重試」的需求，優先考慮在不需要重新 captcha／不需要重新掃 proxy 清單的範圍內解決（例如提高既有計數上限），而不是重新走一次完整的 URL 產生流程。
 
+- [x] **R2-17 下載開始前先預覽「上次下載到幾%」（使用者提出，2026-07-18 立項並完成）**
+  - **使用者需求**：在不能下載的期間（例如 proxy pool 暫時不穩），如果貼上跟之前一樣的 download source，能不能看到上次下載到幾 %？希望能用 local txt 記錄並顯示在 UI 上。
+  - **現況分析**：R2-13 的續傳 manifest（`<filename>.manifest.json`）本來就已經是這樣一份 local 記錄，但只有在「真的按下 Start download、`_download_once` 實際跑起來」之後，`_prepare_resume` 才會讀取並在 log 印出「Resuming: found N/M segment(s)...」——貼上 URL 當下、還沒開始下載前，完全看不到任何進度資訊。
+  - **實作**：新增 `Downloader.find_resume_progress(tmp_dir, file_id)`（`staticmethod`，回傳 `ResumeProgress` NamedTuple：`filename`／`downloaded_bytes`／`total_size`／`percent`）；掃描 `tmp_dir` 下所有 `*.manifest.json`，找出 `data["file_id"]` 相符的第一份即回傳其進度——不需要事先知道解析後檔名（那需要打一次 `k2s_client.get_name` API），因為 `extract_file_id(url)` 純本機正規表示式比對，整個查詢不打任何網路請求。刻意不比照 `_prepare_resume` 對照磁碟 part 檔驗證（那是為了下載正確性；這裡只是預覽提示，容錯層級不同，值得用更輕量的實作換取簡單）。`gui/main_window.py` 新增 `resume_hint_label`（預設隱藏），接到 `url_edit.editingFinished` signal：貼上 URL 後按 Tab／Enter 離開輸入框，若找到相符 manifest 就立刻顯示「Previous progress found: 65.0% (650.000 MiB / 1.000 GiB) of "xxx.mp4" -- starting this download will resume from there.」；找不到相符 manifest 或 URL 無效則隱藏提示；按下 Start download 時也會先隱藏（避免顯示過期資訊）。
+  - 測試：`tests/test_downloader_resume_and_streaming.py::TestFindResumeProgress`（6 個：tmp_dir 不存在、無相符 manifest、正確計算百分比、忽略損毀 manifest、忽略缺欄位的 manifest、以及用真實下載跑出來的 manifest 驗證 schema 一致）。GUI 端手動用已裝 PySide6 的本機環境跑過（`MainWindow` 實例化、設定 URL、觸發 `editingFinished`、確認 label 正確顯示/隱藏），未寫自動化 GUI 測試（符合 AGENTS.md 既有慣例）。核心測試套件（155 項）全數通過，`ruff check .` 乾淨。
+  - 文件：`docs/ai/requirements.md`／`docs/human/requirements.md` 新增 AC-10.7、AC-11.5；`docs/ai/architecture.md`／`docs/human/architecture.md` §2 控制流程段落後補充說明。
+
 ---
 
 ## 建議處理順序
@@ -180,7 +187,7 @@
 > 第一輪（P0 ~ P5）的處理順序與完成紀錄已隨該輪一併封存，見
 > [`todolist-archive/round-1-p0-p5.md`](todolist-archive/round-1-p0-p5.md) 的「完成紀錄」段落。
 
-第二輪（R2-1 ~ R2-16）：R2-1~R2-9、R2-13、R2-16 已完成；R2-10 完成第 1~4 點（第 5 點延後、第 6 點不
+第二輪（R2-1 ~ R2-17）：R2-1~R2-9、R2-13、R2-16、R2-17 已完成；R2-10 完成第 1~4 點（第 5 點延後、第 6 點不
 採用）；R2-11 部分完成（telemetry 與零成本提示已做，「依數據調整預設」需要真實使用數據才能決定，留待
 之後）（見各項狀態與 PR 連結）。R2-12 仍未認領，建議等 R2-11 的 telemetry 累積到真實使用數據後再決定
 要採用哪個尾端對策；其對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。

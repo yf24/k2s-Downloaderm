@@ -152,6 +152,15 @@ class FailedChunk(NamedTuple):
     attempt_count: int
 
 
+class ResumeProgress(NamedTuple):
+    """A previous run's progress for some file, found via ``Downloader.find_resume_progress``."""
+
+    filename: str
+    downloaded_bytes: int
+    total_size: int
+    percent: float
+
+
 class DownloadCancelled(RuntimeError):
     """Raised when a download is cancelled by the user."""
 
@@ -320,6 +329,47 @@ class Downloader:
         if not match:
             raise ValueError("Invalid URL")
         return match.group(2)
+
+    @staticmethod
+    def find_resume_progress(tmp_dir: Path | str, file_id: str) -> Optional[ResumeProgress]:
+        """Best-effort lookup of a previous run's progress for ``file_id``.
+
+        Scans ``tmp_dir`` for a ``*.manifest.json`` whose recorded
+        ``file_id`` matches -- doesn't require knowing the resolved
+        filename in advance (that would need an API call), and works from
+        just the URL. This is purely informational (e.g. surfacing "you're
+        65% through this file already" in the GUI before a download even
+        starts); unlike ``_prepare_resume``, it does not re-verify against
+        on-disk part files, so treat the result as an estimate.
+        """
+        tmp_dir = Path(tmp_dir)
+        if not tmp_dir.exists():
+            return None
+        for manifest_path in tmp_dir.glob("*.manifest.json"):
+            try:
+                with manifest_path.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict) or data.get("file_id") != file_id:
+                continue
+            total_size = data.get("total_size")
+            ranges = data.get("ranges")
+            if not isinstance(total_size, int) or total_size <= 0 or not isinstance(ranges, dict):
+                continue
+            downloaded_bytes = sum(
+                int(meta.get("bytes", 0))
+                for meta in ranges.values()
+                if isinstance(meta, dict) and meta.get("downloaded")
+            )
+            filename = manifest_path.name[: -len(".manifest.json")]
+            return ResumeProgress(
+                filename=filename,
+                downloaded_bytes=downloaded_bytes,
+                total_size=total_size,
+                percent=(downloaded_bytes / total_size * 100.0),
+            )
+        return None
 
     @staticmethod
     def _resolve_filename(user_filename: Optional[str], original_name: str) -> str:

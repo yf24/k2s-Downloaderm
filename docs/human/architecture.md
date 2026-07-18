@@ -57,6 +57,8 @@ CLI/GUI
 
 `download()` 是前端唯一會呼叫的公開入口。`_download_once` 底下的內容都是 `Downloader` 的 private 實作細節，目的是讓 `_download_once` 本身保持精簡 — 見第 5 節。
 
+**下載開始前先預覽續傳進度（R2-17）**：`Downloader.find_resume_progress(tmp_dir, file_id)`（`staticmethod`，跟上面只在真正下載進行中才會跑的 instance method `_prepare_resume`不同）會掃描 `tmp_dir` 底下所有 `*.manifest.json`，找出 `file_id` 相符的那一份 —— 不需要事先知道解析後的檔名（那需要打一次 API），因為 `extract_file_id(url)` 純粹是本機的正規表示式比對，所以整個查詢過程完全不打網路。`gui/main_window.py` 把這個查詢接到 `url_edit` 的 `editingFinished` signal，所以貼上一個之前中斷過的下載連結，會立刻顯示上次的完成百分比 —— 在使用者按下「Start download」之前就看得到。跟 `_prepare_resume` 不同的是，這只是預覽用途 —— 它直接信任 manifest 記錄的位元組數，不會再對照磁碟上實際的 part 檔驗證，因為這裡猜錯的代價只是提示標籤上的數字有點不準，不是合併出損毀的檔案。
+
 ## 3. Threading 與並發模型
 
 `Downloader` 的排程迴圈跑在呼叫端自己的 thread（`download()` 會阻塞直到檔案完成、被取消、或失敗），並為每個進行中的區段各自產生一個短生命週期的 `threading.Thread`，最多同時 `threads` 個。這裡沒有 thread pool；thread 建立後各自完成／結束（`daemon=True`），透過搶佔固定數量的 `url_locks` 其中一個來控管。
