@@ -35,26 +35,24 @@ CLI/GUI
        ├─ refresh_proxies()                                 # if not already populated
        ├─ extract_file_id(url)                              # REQ-1
        ├─ k2s_client.get_name(file_id)                       # REQ-2 (filename)
-       └─ outer loop (up to MAX_DOWNLOAD_RETRIES attempts, AC-4.5):
-             ├─ _generate_urls_for_attempt(...)               # REQ-5 (fresh captcha each attempt) + one URL per thread
-             │     └─ k2s_client.generate_download_urls(...)
-             │           ├─ fetch_captcha() -> captcha_callback(...)
-             │           └─ per proxy: solve captcha -> free_download_key -> batch-fetch `count` URLs
-             └─ inner loop (at most twice per outer attempt, for the media-recheck retry in AC-8.2):
-                   └─ _download_once(urls, filename, threads, split_size)
-                        ├─ _fetch_total_size(url, headers)          # REQ-2 (size, HEAD request)
-                        ├─ _build_ranges(total_size, split_count)     # REQ-3 (contiguous byte ranges)
-                        ├─ _prepare_resume(...)                       # REQ-11 (skip already-completed ranges)
-                        └─ _run_scheduling_loop(ranges, ...)          # REQ-3/4 (dispatch + retry/backoff)
-                              └─ per range, in its own thread:
-                                    _download_chunk(...)
-                                      ├─ _acquire_proxy_lock()         # REQ-6 (direct-first)
-                                      ├─ requests.get(Range: bytes=...)
-                                      ├─ on success: write .partNNN, mark range done
-                                      └─ on failure: _mark_chunk_failed() -> backoff or permanent failure
-                        └─ _merge_parts(ranges, filename, split_count)  # REQ-3.6 (concatenate + cleanup)
-       (a ChunkDownloadFailed that exhausts the inner loop's retries is caught by the outer loop and
-       the whole attempt is retried -- see AC-4.5 -- rather than propagating out of download() immediately)
+       ├─ k2s_client.generate_download_urls(...)              # REQ-5 (captcha) + one URL per thread
+       │     ├─ fetch_captcha() -> captcha_callback(...)
+       │     └─ per proxy: solve captcha -> free_download_key -> batch-fetch `count` URLs
+       └─ loop (at most twice, for the media-recheck retry in AC-8.2):
+             └─ _download_once(urls, filename, threads, split_size)
+                  ├─ _fetch_total_size(url, headers)          # REQ-2 (size, HEAD request)
+                  ├─ _build_ranges(total_size, split_count)     # REQ-3 (contiguous byte ranges)
+                  ├─ _prepare_resume(...)                       # REQ-11 (skip already-completed ranges)
+                  └─ _run_scheduling_loop(ranges, ...)          # REQ-3/4 (dispatch + retry/backoff)
+                        └─ per range, in its own thread:
+                              _download_chunk(...)
+                                ├─ _acquire_proxy_lock()         # REQ-6 (direct-first)
+                                ├─ requests.get(Range: bytes=...)
+                                ├─ on success: write .partNNN, mark range done
+                                └─ on failure: _mark_chunk_failed() -> backoff or permanent failure (ChunkDownloadFailed
+                                   propagates straight out of download() -- see R2-16 in todolist.md for why this
+                                   isn't auto-retried at the whole-download level)
+                  └─ _merge_parts(ranges, filename, split_count)  # REQ-3.6 (concatenate + cleanup)
 ```
 
 `download()` is the only public entry point front ends call. Everything under `_download_once` is private to `Downloader` and exists to keep that method itself short — see § 5.
@@ -97,7 +95,7 @@ Security posture (see also [Readme.md](../../Readme.md)'s "Security Note: Public
 | Exception | Raised when | Caller-visible meaning |
 |---|---|---|
 | `DownloadCancelled` | `stop_event` was set (via `Downloader.cancel()`) at any point during `download()` | "The user/caller stopped this." Not an error. |
-| `ChunkDownloadFailed` | A single byte-range chunk exhausted `MAX_CHUNK_RETRIES` (8) attempts; only reaches the caller after `download()`'s own `MAX_DOWNLOAD_RETRIES` (3) whole-download re-attempts (AC-4.5) are also exhausted | "We gave up." Distinguished from `DownloadCancelled` so callers can render different UI/exit codes for "you stopped it" vs. "it couldn't complete." |
+| `ChunkDownloadFailed` | A single byte-range chunk exhausted `MAX_CHUNK_RETRIES` (25) attempts | "We gave up." Distinguished from `DownloadCancelled` so callers can render different UI/exit codes for "you stopped it" vs. "it couldn't complete." Deliberately *not* auto-retried at the whole-download level — see R2-16 in `todolist.md`. |
 | `K2SFileNotFound` | Keep2Share's API reports the file doesn't exist | Catchable, non-fatal — replaces a previous `sys.exit()` that used to kill the entire process (including a hosting GUI) from a background thread. |
 | `OperationCancelled` (in `k2s_client`) | `stop_event` was set during captcha/URL-generation, before any chunk download started | Caught by `Downloader.download()` and re-raised as `DownloadCancelled` so callers only ever need to handle one cancellation exception type regardless of which phase was cancelled. |
 | `RuntimeError` (various messages) | Network-unreachable during size/name lookup; captcha rejected `MAX_CAPTCHA_ATTEMPTS` times; every proxy exhausted with zero working URLs; size undeterminable | Each message names the likely cause (blocked IP, rate limit, etc.) rather than surfacing a bare `requests` exception. |
@@ -107,8 +105,7 @@ Retry/backoff parameters (module-level constants in `downloader.py` / `k2s_clien
 
 | Constant | Value | Governs |
 |---|---|---|
-| `MAX_CHUNK_RETRIES` | 8 | Attempts per byte-range chunk before `ChunkDownloadFailed` |
-| `MAX_DOWNLOAD_RETRIES` | 3 | Whole-download re-attempts (fresh captcha + URLs, resume skips completed ranges) after a `ChunkDownloadFailed` before it's raised to the caller |
+| `MAX_CHUNK_RETRIES` | 25 | Attempts per byte-range chunk before `ChunkDownloadFailed` (raised 8 -> 25 in R2-16's revert -- see `todolist.md`) |
 | `CHUNK_RETRY_BACKOFF_BASE` / `_CAP` | 1.0s / 30.0s | Exponential backoff between chunk retry attempts |
 | `MAX_CAPTCHA_ATTEMPTS` | 3 | Rejected captcha answers before giving up |
 | `MAX_URL_BATCH_ROUNDS` | 3 | Consecutive zero-progress rounds fetching download URLs from one proxy before trying the next |

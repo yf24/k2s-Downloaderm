@@ -164,13 +164,14 @@
 
 ## R2-P7 — 可靠性：單一區段永久失敗不該讓整個下載直接放棄
 
-- [x] **R2-16 `ChunkDownloadFailed` 後自動重跑整個下載（依賴既有續傳機制），不需使用者手動重試**（2026-07-18 使用者實際用打包出的 exe 下載大檔時觸發，立項並當場完成）
-  - **使用者痛點**：實測時某個 chunk 重試 8 次全部透過壞掉的 proxy 逾時，最終整個下載直接失敗中止，訊息只留下「可能被封鎖」的提示；使用者得自己手動重新點「Start download」才能繼續 —— 而且不清楚重新開始是否要整個檔案重下載一次。
-  - **成因分析**：`download()` 原本只有「單一 chunk 最多重試 8 次」（`MAX_CHUNK_RETRIES`）這一層防護；一旦某個 chunk 耗盡這 8 次（可能只是運氣不好連續抽到 8 個爛 proxy，尤其在 R2-10 的降級機制還沒累積足夠資料淘汰壞 proxy 之前），`ChunkDownloadFailed` 會直接從 `download()` 丟出，沒有任何更高層的重試。R2-13 已經做出「以磁碟為準的續傳 manifest」，理論上重新呼叫一次 `download()` 只需要補齊真正卡住的那幾個 chunk，但這件事完全沒有自動化，使用者不知道、也不會主動這樣做。
-  - **實作**：`Downloader.download()` 拆成外層（重試整次下載，新增 `MAX_DOWNLOAD_RETRIES = 3`）＋內層（原本就有的媒體檢查重試）兩層迴圈；`_generate_urls_for_attempt()`（從原本 `download()` 內聯的 URL 產生／captcha 段落抽出）在外層每次重跑都重新呼叫一次，重新解一次 captcha、拿新的一批下載 URL。內層迴圈丟出的 `ChunkDownloadFailed` 被外層 `except` 攔截：未達 `MAX_DOWNLOAD_RETRIES` 就記一則 log 訊息並 `continue`（重跑 `_download_once` 時 `_prepare_resume` 會自動跳過已完成區段，只補真正卡住的部分）；達到上限才把原始例外真正丟給呼叫端。`DownloadCancelled`（含 `stop_event` 被設定、或 URL 產生階段的 `OperationCancelled` 轉換）與其他例外型別完全不觸發這個重試 —— 只有 `ChunkDownloadFailed` 會。
-  - **取捨**：因為每次重跑都要重新解 captcha（`k2s_client.generate_download_urls` 的既有設計就是每次呼叫都要求一次 captcha，captcha 自動化本來就不在本專案範疇內，見 AGENTS.md §1「範疇外」），所以這不是完全靜默的重試 —— GUI 情境下使用者可能會再看到一次 captcha 輸入框。但比起原本「整個下載直接失敗、使用者自己重新點擊」已經省掉大部分手動步驟，且續傳機制保證不會真的整檔重下載。
-  - 測試：`tests/test_downloader_whole_download_retry.py`（5 個：`ChunkDownloadFailed` 觸發自動重試並最終成功、每次重試都重新解 captcha、重試次數耗盡後原例外仍會被丟出、取消不會被重試、非 `ChunkDownloadFailed` 的例外不會被重試）。核心測試套件（153 項）全數通過，`ruff check .` 乾淨。
-  - 文件：`docs/ai/requirements.md`／`docs/human/requirements.md` 新增 AC-4.5、調整 AC-4.1 措辭；`docs/ai/architecture.md`／`docs/human/architecture.md` §2 控制流程圖改成外層/內層兩層迴圈、§5 錯誤分類表補充 `ChunkDownloadFailed` 現在何時才真正丟出、重試/backoff 參數表新增 `MAX_DOWNLOAD_RETRIES`。
+- [x] **R2-16 `ChunkDownloadFailed` 後自動重跑整個下載 → 實測後判定方向錯誤，改為提高單一 chunk 的重試上限**（2026-07-18 使用者實際用打包出的 exe 下載大檔時觸發，立項、實作、實測後當天推翻重做）
+  - **原始使用者痛點**：某個 chunk 重試 8 次全部透過壞掉的 proxy 逾時，整個下載直接失敗中止；使用者得自己手動重新點「Start download」才能繼續，且不清楚重新開始是否要整個檔案重下載一次。
+  - **第一版做法（已推翻）**：`Downloader.download()` 拆成外層（重試整次下載，`MAX_DOWNLOAD_RETRIES = 3`）＋內層（既有媒體檢查重試）兩層迴圈；`ChunkDownloadFailed` 被外層攔截後重新解一次 captcha、重新取一批下載 URL、重跑（靠 R2-13 的續傳跳過已完成區段）。
+  - **實測後發現的問題（使用者第一手回報）**：這個做法讓體驗明顯變差，而非變好。原因：①`k2s_client.generate_download_urls` 每次都要重新解 captcha，且會依序遍歷整個 `self.proxies` 清單找一個能用的 proxy 來換 `free_download_key`——R2-10 把候選來源擴充成多來源聯集後，這份清單變得又大又混雜大量已死的 proxy，導致「重新產生 URL」這個步驟本身就要跑很久、且每次都要使用者重新輸入一次 captcha。使用者原話：「原本的應用...只要能開始下載基本上都可以下載完，即使到最後速度變很慢，現在這樣常常跟我說 proxy 斷掉然後就切掉我又要重新 captcha...人不注意的時候根本不可能載完」。換句話說：把「整個下載」當成重試單位、還要求使用者互動（captcha），對「單一 chunk 運氣不好抽到爛 proxy」這種其實很常見的情況來說是不成比例的重手段。
+  - **改用的做法**：完全還原 `download()` 到單一嘗試的原始結構（移除外層迴圈、`_generate_urls_for_attempt` 輔助方法、`MAX_DOWNLOAD_RETRIES` 常數），改成把 `MAX_CHUNK_RETRIES` 從 8 大幅調高到 25——同一個 chunk 在**同一個 session 內**（沿用已經取得的下載 URL，不需要新 captcha、不需要重新遍歷 proxy 清單）就能有更多機會換到能用的連線；再加上 R2-10 的降級機制（同一 proxy 連續失敗會被排除出優先清單），下載跑得越久，能用的 proxy 名單會越乾淨。真正到了 25 次都失敗（判斷是來源 IP 或整個 proxy pool 都被封鎖），才維持原本行為：整個下載中止、丟出 `ChunkDownloadFailed`，使用者自行決定要不要手動重試（重試時 R2-13 的續傳一樣會跳過已完成的部分）。
+  - 測試：`tests/test_downloader_whole_download_retry.py` 改寫成單一項回歸測試，鎖定「`ChunkDownloadFailed` 只會呼叫一次 URL 產生（=一次 captcha），不會觸發第二次」，防止未來不小心又把這個已經被推翻的自動重試機制加回來。核心測試套件（149 項）全數通過，`ruff check .` 乾淨。
+  - 文件：`docs/ai/requirements.md`／`docs/human/requirements.md` 的 AC-4.5 已移除、AC-4.1 改回描述單次下載中止並補充「為何不做整個下載層級的自動重試」；`docs/ai/architecture.md`／`docs/human/architecture.md` §2 控制流程圖還原成單層迴圈、§5 錯誤分類表與重試/backoff 參數表更新為 `MAX_CHUNK_RETRIES = 25`（移除 `MAX_DOWNLOAD_RETRIES` 條目）。
+  - **給下一個 agent 的教訓**：這是一個「看起來合理但實測後被證明方向錯誤」的案例——加自動重試前，務必想清楚重試單位的成本（這裡的成本是「使用者互動」和「掃過整個 proxy 清單」），而不是只看「使用者不用手動重試」這個表面的好處。之後如果又有類似「下載失敗希望自動重試」的需求，優先考慮在不需要重新 captcha／不需要重新掃 proxy 清單的範圍內解決（例如提高既有計數上限），而不是重新走一次完整的 URL 產生流程。
 
 ---
 
