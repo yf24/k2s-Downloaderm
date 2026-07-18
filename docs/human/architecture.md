@@ -35,26 +35,24 @@ CLI/GUI
        ├─ refresh_proxies()                                 # 若尚未取得 proxy 清單
        ├─ extract_file_id(url)                              # REQ-1
        ├─ k2s_client.get_name(file_id)                       # REQ-2（檔名）
-       └─ 外層迴圈（最多 MAX_DOWNLOAD_RETRIES 次，AC-4.5）：
-             ├─ _generate_urls_for_attempt(...)               # REQ-5（每次嘗試都重新解 captcha）+ 每個 thread 一個 URL
-             │     └─ k2s_client.generate_download_urls(...)
-             │           ├─ fetch_captcha() -> captcha_callback(...)
-             │           └─ 針對每個 proxy：解 captcha -> free_download_key -> 批次取得 `count` 個 URL
-             └─ 內層迴圈（每次外層嘗試最多兩次，對應 AC-8.2 的媒體檢查重試）：
-                   └─ _download_once(urls, filename, threads, split_size)
-                        ├─ _fetch_total_size(url, headers)          # REQ-2（大小，HEAD 請求）
-                        ├─ _build_ranges(total_size, split_count)     # REQ-3（連續 byte range）
-                        ├─ _prepare_resume(...)                       # REQ-11（跳過已完成區段）
-                        └─ _run_scheduling_loop(ranges, ...)          # REQ-3/4（派工＋重試／backoff）
-                              └─ 每個區段各自在獨立 thread 執行：
-                                    _download_chunk(...)
-                                      ├─ _acquire_proxy_lock()         # REQ-6（直連優先）
-                                      ├─ requests.get(Range: bytes=...)
-                                      ├─ 成功：寫入 .partNNN，標記該區段完成
-                                      └─ 失敗：_mark_chunk_failed() -> backoff 或永久失敗
-                        └─ _merge_parts(ranges, filename, split_count)  # AC-3.6（串接＋清理）
-       （內層迴圈重試耗盡後丟出的 ChunkDownloadFailed 會被外層迴圈攔截並重跑整次嘗試 —— 見 AC-4.5 ——
-       而不是立刻讓 download() 中止）
+       ├─ k2s_client.generate_download_urls(...)              # REQ-5（captcha）+ 每個 thread 一個 URL
+       │     ├─ fetch_captcha() -> captcha_callback(...)
+       │     └─ 針對每個 proxy：解 captcha -> free_download_key -> 批次取得 `count` 個 URL
+       └─ 迴圈（最多兩次，對應 AC-8.2 的媒體檢查重試）：
+             └─ _download_once(urls, filename, threads, split_size)
+                  ├─ _fetch_total_size(url, headers)          # REQ-2（大小，HEAD 請求）
+                  ├─ _build_ranges(total_size, split_count)     # REQ-3（連續 byte range）
+                  ├─ _prepare_resume(...)                       # REQ-11（跳過已完成區段）
+                  └─ _run_scheduling_loop(ranges, ...)          # REQ-3/4（派工＋重試／backoff）
+                        └─ 每個區段各自在獨立 thread 執行：
+                              _download_chunk(...)
+                                ├─ _acquire_proxy_lock()         # REQ-6（直連優先）
+                                ├─ requests.get(Range: bytes=...)
+                                ├─ 成功：寫入 .partNNN，標記該區段完成
+                                └─ 失敗：_mark_chunk_failed() -> backoff 或永久失敗（ChunkDownloadFailed
+                                   會直接從 download() 丟出 —— 為什麼不在整個下載層級自動重跑，見
+                                   todolist.md 的 R2-16）
+                  └─ _merge_parts(ranges, filename, split_count)  # AC-3.6（串接＋清理）
 ```
 
 `download()` 是前端唯一會呼叫的公開入口。`_download_once` 底下的內容都是 `Downloader` 的 private 實作細節，目的是讓 `_download_once` 本身保持精簡 — 見第 5 節。
@@ -97,7 +95,7 @@ CLI/GUI
 | 例外 | 何時丟出 | 對呼叫端的意義 |
 |---|---|---|
 | `DownloadCancelled` | `download()` 執行期間任何時候 `stop_event` 被設定（透過 `Downloader.cancel()`） | 「使用者／呼叫端自己停止的」，不算錯誤。 |
-| `ChunkDownloadFailed` | 單一 byte-range 區段耗盡 `MAX_CHUNK_RETRIES`（8）次嘗試；要等 `download()` 自己的 `MAX_DOWNLOAD_RETRIES`（3）次整個下載重跑（AC-4.5）也耗盡才會真正丟給呼叫端 | 「我們放棄了」。與 `DownloadCancelled` 區分開，讓呼叫端可以針對「你自己停的」跟「跑不完」分別呈現不同的 UI／exit code。 |
+| `ChunkDownloadFailed` | 單一 byte-range 區段耗盡 `MAX_CHUNK_RETRIES`（25）次嘗試 | 「我們放棄了」。與 `DownloadCancelled` 區分開，讓呼叫端可以針對「你自己停的」跟「跑不完」分別呈現不同的 UI／exit code。刻意**不**在整個下載層級自動重跑 —— 見 `todolist.md` 的 R2-16。 |
 | `K2SFileNotFound` | Keep2Share API 回報檔案不存在 | 可被捕捉、非致命 — 取代了舊版會從背景 thread 直接 `sys.exit()` 殺掉整個 process（含 GUI）的行為。 |
 | `OperationCancelled`（在 `k2s_client` 內） | 在 captcha／URL 產生階段（尚未開始任何區塊下載前）`stop_event` 被設定 | 會被 `Downloader.download()` 捕捉並重新丟成 `DownloadCancelled`，讓呼叫端無論在哪個階段被取消，都只需處理一種取消例外類型。 |
 | `RuntimeError`（各種訊息） | 查詢大小／檔名時網路不可達；captcha 答錯達 `MAX_CAPTCHA_ATTEMPTS` 次；所有 proxy 都試過仍拿不到任何可用 URL；大小無法判斷 | 每則訊息都會指出可能原因（IP 被封鎖、速率限制等），而不是直接丟出原始的 `requests` 例外。 |
@@ -107,8 +105,7 @@ CLI/GUI
 
 | 常數 | 值 | 控制對象 |
 |---|---|---|
-| `MAX_CHUNK_RETRIES` | 8 | 單一 byte-range 區段在丟出 `ChunkDownloadFailed` 前的嘗試次數 |
-| `MAX_DOWNLOAD_RETRIES` | 3 | `ChunkDownloadFailed` 後、真正丟給呼叫端前，整個下載自動重跑（重新解 captcha＋重新取 URL，續傳會跳過已完成區段）的次數 |
+| `MAX_CHUNK_RETRIES` | 25 | 單一 byte-range 區段在丟出 `ChunkDownloadFailed` 前的嘗試次數（R2-16 revert 時從 8 調高 —— 見 `todolist.md`） |
 | `CHUNK_RETRY_BACKOFF_BASE` / `_CAP` | 1.0 秒 / 30.0 秒 | 區段重試之間的指數 backoff |
 | `MAX_CAPTCHA_ATTEMPTS` | 3 | 放棄前允許 captcha 答錯的次數 |
 | `MAX_URL_BATCH_ROUNDS` | 3 | 同一個 proxy 連續幾輪拿不到任何新 URL 就換下一個 |
