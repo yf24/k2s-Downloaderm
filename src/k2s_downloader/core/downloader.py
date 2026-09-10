@@ -87,6 +87,34 @@ def _truncate_error_message(message: str) -> str:
     return _LONG_QUERY_STRING_RE.sub("?<truncated>", message)
 
 
+# `Content-Range: bytes <first>-<last>/<complete-length>` -- the header every
+# 206 response must carry (RFC 9110). Parsed so a chunk can prove the bytes it
+# just streamed really are the bytes it asked for: a response of the right
+# *length* but the wrong *offset* (a proxy or storage node serving a cached or
+# rewritten range) is otherwise indistinguishable from success, and splices
+# foreign bytes into the middle of the merged file with nothing downstream
+# able to notice.
+_CONTENT_RANGE_RE = re.compile(r"^\s*bytes\s+(\d+)\s*-\s*(\d+)\s*/\s*(?:\d+|\*)\s*$", re.IGNORECASE)
+
+
+def _parse_content_range(raw: object) -> Optional[tuple[int, int]]:
+    """Return ``(first, last)`` from a ``Content-Range`` header, or ``None``.
+
+    ``None`` covers every "can't tell" case -- header absent, a unit other
+    than bytes, the unsatisfied-range form (``bytes */1234``) -- and leaves
+    the byte-count check as the only guard rather than failing a chunk over
+    a header this code could not read. Takes ``object`` because that is what
+    ``requests``' case-insensitive header mapping hands back for a missing
+    key (``None``).
+    """
+    if not isinstance(raw, str):
+        return None
+    match = _CONTENT_RANGE_RE.match(raw)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 # Timeout (seconds) for the HEAD request used to discover total file size.
 # Previously unset, so a blocked/unresponsive IP would hang here forever.
 HEAD_REQUEST_TIMEOUT = 15
@@ -172,6 +200,20 @@ class ChunkDownloadFailed(RuntimeError):
     blocked or rate-limited by the host, rather than a one-off network
     hiccup. Distinguished from ``DownloadCancelled`` so callers can tell
     "the user stopped it" apart from "we gave up".
+    """
+
+
+class DownloadIntegrityError(RuntimeError):
+    """Raised when the bytes on disk fail a verification the merge relies on.
+
+    Every chunk is size-checked when it lands, but nothing re-checked the
+    part files at merge time or the merged file afterwards, so anything that
+    damaged a part *after* it was accepted (a crash, an interrupted write, a
+    stale part from an older run) produced a silently corrupt output file --
+    the failure only ever surfaced later, as an archive that refuses to
+    extract. A subclass of ``RuntimeError`` so existing callers that already
+    handle the "download failed for an environmental reason" case keep
+    working; distinct so a caller can tell it apart from a network failure.
     """
 
 
@@ -487,6 +529,13 @@ class Downloader:
             with self._manifest_lock:
                 with tmp_manifest_path.open("w", encoding="utf-8") as handle:
                     json.dump(payload, handle)
+                    # A manifest that survives a crash half-written parses as
+                    # corrupt on the next run, which _prepare_resume treats as
+                    # "no previous progress" -- and that path deletes every
+                    # part file for this filename. Cheap insurance (one small
+                    # file) against throwing away a mostly-finished download.
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 tmp_manifest_path.replace(manifest_path)
         except OSError as exc:
             self.log(f"Could not update resume manifest ({exc}); download continues without it.")
@@ -545,7 +594,7 @@ class Downloader:
             part_path = self._part_path(filename, idx, len(ranges))
             if not part_path.exists():
                 continue
-            if not math.isclose(part_path.stat().st_size, meta["bytes"], abs_tol=1):
+            if part_path.stat().st_size != meta["bytes"]:
                 continue
             meta["downloaded"] = True
             resumed_count += 1
@@ -917,6 +966,43 @@ class Downloader:
             f"({split_text}; {active} active connection(s))."
         )
 
+    @staticmethod
+    def _check_served_range(
+        response: requests.Response, chunk_range: object, split_count: int
+    ) -> Optional[str]:
+        """Return why ``response`` is not the requested byte range, or ``None``.
+
+        The byte-count check further down proves *how much* arrived, never
+        *which bytes*. Two success responses fail that distinction:
+
+        * ``200`` means the server ignored ``Range`` entirely and is sending
+          the whole file from offset 0. For a single-range download that is
+          the same bytes either way; for a split download it is the wrong
+          data for every chunk but the first.
+        * a ``206`` whose ``Content-Range`` describes a different window than
+          the one requested (a caching proxy or storage node serving a
+          rewritten range). Same length, wrong bytes -- invisible to every
+          other check in this class, and fatal to the merged file.
+
+        A ``206`` without a readable ``Content-Range`` is accepted: the header
+        is unreadable, not contradictory, and the byte count still applies.
+        """
+        if response.status_code == 200:
+            if split_count > 1:
+                return "HTTP 200: server ignored the Range request"
+            return None
+
+        served = _parse_content_range(response.headers.get("Content-Range"))
+        if served is None:
+            return None
+        try:
+            first, last = (int(part) for part in str(chunk_range).split("-"))
+        except ValueError:  # pragma: no cover - _build_ranges always emits "a-b"
+            return None
+        if served != (first, last):
+            return f"served bytes {served[0]}-{served[1]} instead of {first}-{last}"
+        return None
+
     def _download_chunk(
         self,
         index: str,
@@ -952,6 +1038,9 @@ class Downloader:
         # never mistake a half-written attempt for a complete one.
         tmp_write_path = tmp_filename.with_name(tmp_filename.name + ".tmp")
         bytes_written = 0
+        # Set from the file itself once streaming ends; -1 until then so the
+        # verification below can never read a stale/unset value as a pass.
+        bytes_on_disk = -1
 
         chunk_start_time = time.time()
 
@@ -1001,6 +1090,21 @@ class Downloader:
                     )
                     return
 
+                range_error = self._check_served_range(response, chunk_range, ctx.split_count)
+                if range_error is not None:
+                    # The response is a success but describes bytes other than
+                    # the ones this chunk asked for. Length alone cannot catch
+                    # this (a wrong-offset range of the right length looks
+                    # exactly like a good one), and accepting it splices
+                    # foreign bytes into the middle of the merged file.
+                    response.close()
+                    self._mark_chunk_failed(
+                        range_meta,
+                        f"{range_error} via proxy {proxy_value or 'LOCAL'}",
+                        proxy_idx=proxy_idx,
+                    )
+                    return
+
                 with tmp_write_path.open("wb") as part_file:
                     for data in response.iter_content(self.block_size):
                         if self.stop_event.is_set():
@@ -1018,6 +1122,15 @@ class Downloader:
                         part_file.flush()
                         bytes_written += len(data)
                         self._report_progress(len(data), ctx, is_direct=proxy_idx == 0)
+                    # Flushing (above) only hands the bytes to the OS. Without
+                    # an fsync before the rename below publishes this part as
+                    # complete, a crash or power loss can leave a part file
+                    # with the right *length* but unwritten (zero-filled)
+                    # contents -- which the resume path, having only the
+                    # length to go on, would then accept as good.
+                    part_file.flush()
+                    os.fsync(part_file.fileno())
+                    bytes_on_disk = os.fstat(part_file.fileno()).st_size
             except requests.exceptions.RequestException as exc:
                 # Network-level failure (connection error, read timeout,
                 # a chunked-encoding error mid-stream, etc.). Previously
@@ -1033,12 +1146,19 @@ class Downloader:
                 )
                 return
 
-            if not math.isclose(bytes_written, expected_bytes, abs_tol=1):
+            # Exact equality, not a tolerance: a chunk that is a single byte
+            # short shifts every following byte of the merged file, which
+            # decodes as a still-playable video but a permanently broken
+            # archive. `bytes_on_disk` is checked alongside the running
+            # counter because the counter only proves what was handed to
+            # `write()`, not what the file actually holds.
+            if bytes_written != expected_bytes or bytes_on_disk != expected_bytes:
                 self._report_progress(-bytes_written, ctx, is_direct=proxy_idx == 0)
                 tmp_write_path.unlink(missing_ok=True)
                 self._mark_chunk_failed(
                     range_meta,
-                    f"size mismatch: got {bytes_written} expected {expected_bytes}",
+                    f"size mismatch: got {bytes_written} ({bytes_on_disk} on disk) "
+                    f"expected {expected_bytes}",
                     proxy_idx=proxy_idx,
                 )
                 # Do NOT release url_locks[thread_index] here: the ``finally``
@@ -1158,7 +1278,7 @@ class Downloader:
                         # needless buffering R2-7 removed from the download
                         # path itself.
                         existing_size = part_path.stat().st_size
-                        if math.isclose(existing_size, meta["bytes"], abs_tol=1):
+                        if existing_size == meta["bytes"]:
                             # Claim the range under _progress_lock so this
                             # check-and-mark cannot interleave with the chunk
                             # thread's own completion publish (which holds the
@@ -1230,7 +1350,44 @@ class Downloader:
 
         return failed_chunk
 
+    def _verify_parts(self, ranges: Dict[str, Dict[str, object]], filename: str) -> int:
+        """Re-check every part file against its range before merging them.
+
+        A part was size-checked when it landed, but that was potentially a
+        different run: a crash mid-write, a truncated resume, or an
+        interrupted `.tmp` rename can leave a part on disk that no longer
+        matches the range it stands for, and the merge itself would happily
+        splice it in. Verified up front, before a single byte of the output
+        is written, so a mismatch leaves every part and the manifest intact
+        -- the next run then resumes and re-fetches just the bad segment
+        (both `_prepare_resume` and the scheduling loop's reuse branch reject
+        a wrong-sized part and re-download it).
+
+        Returns the total byte count the merged file must end up with.
+        """
+        split_count = len(ranges)
+        expected_total = 0
+        for idx in range(split_count):
+            meta = ranges[str(idx)]
+            expected = int(meta["bytes"])  # type: ignore[arg-type]
+            expected_total += expected
+            part_path = self._part_path(filename, idx, split_count)
+            try:
+                actual = part_path.stat().st_size
+            except OSError:
+                actual = -1
+            if actual != expected:
+                raise DownloadIntegrityError(
+                    f"Segment {idx} of {split_count} is {actual} bytes on disk but should be "
+                    f"{expected} ({part_path.name}); refusing to merge a file that would be "
+                    "corrupt. Start the download again -- the completed segments are kept, so "
+                    "only the damaged one is fetched again."
+                )
+        return expected_total
+
     def _merge_parts(self, ranges: Dict[str, Dict[str, object]], filename: str) -> Path:
+        expected_total = self._verify_parts(ranges, filename)
+
         target_path = Path(filename)
         # filename may carry directory components the caller expects to be
         # created for them (e.g. CLI --filename out/video.mp4); only
@@ -1249,7 +1406,27 @@ class Downloader:
                     # doesn't hold a second full part in memory on top of
                     # whatever's already buffered for the output handle.
                     copyfileobj(chunk, handle)
+                # Deleted as we go, not after the loop: parts and output are
+                # both full-size, so holding on to all of them would need
+                # twice the file's size in free space at the moment of merge.
                 part_path.unlink()
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        final_size = target_path.stat().st_size
+        if final_size != expected_total:
+            # Every part was verified moments ago, so reaching here means the
+            # write itself came up short (a full disk, a failing/disconnected
+            # drive). The parts are already consumed, so there is nothing to
+            # resume from -- delete the half-written output rather than leave
+            # a plausible-looking file that silently fails to extract later.
+            target_path.unlink(missing_ok=True)
+            self._manifest_path(filename).unlink(missing_ok=True)
+            raise DownloadIntegrityError(
+                f"Merged file is {final_size} bytes but should be {expected_total}; the output "
+                "was incomplete (check free disk space) and has been removed. The download "
+                "needs to be run again."
+            )
 
         # Resume manifest's job ends at a successful merge -- every part it
         # was tracking has just been consumed above, so nothing is left to
@@ -1258,7 +1435,7 @@ class Downloader:
         self._manifest_path(filename).unlink(missing_ok=True)
 
         self.log(f"Finished writing {filename}")
-        self.log(f"File Size: {human_readable_bytes(target_path.stat().st_size)}")
+        self.log(f"File Size: {human_readable_bytes(final_size)}")
         return target_path
 
     def _download_once(
