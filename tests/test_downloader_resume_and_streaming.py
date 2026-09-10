@@ -205,7 +205,7 @@ class TestResumeManifest:
         def get_side_effect(*args, **kwargs):
             range_header = kwargs["headers"]["Range"]
             if range_header == "bytes=0-4":
-                return _response(200, lambda block_size: iter([total_body[0:5]]))
+                return _response(206, lambda block_size: iter([total_body[0:5]]))
             return _response(403, lambda block_size: iter([]))
 
         with patch.object(downloader_module, "MAX_CHUNK_RETRIES", 1), patch(
@@ -280,7 +280,7 @@ class TestResumeManifest:
             range_header = kwargs["headers"]["Range"]
             requested_ranges.append(range_header)
             start, end = (int(x) for x in range_header.removeprefix("bytes=").split("-"))
-            return _response(200, lambda block_size, s=start, e=end: iter([total_body[s : e + 1]]))
+            return _response(206, lambda block_size, s=start, e=end: iter([total_body[s : e + 1]]))
 
         with patch(
             "k2s_downloader.core.downloader.requests.head",
@@ -324,7 +324,7 @@ class TestResumeManifest:
             range_header = kwargs["headers"]["Range"]
             requested_ranges.append(range_header)
             start, end = (int(x) for x in range_header.removeprefix("bytes=").split("-"))
-            return _response(200, lambda block_size, s=start, e=end: iter([new_body[s : e + 1]]))
+            return _response(206, lambda block_size, s=start, e=end: iter([new_body[s : e + 1]]))
 
         messages: list[str] = []
         downloader.status_callback = messages.append
@@ -368,7 +368,7 @@ class TestResumeManifest:
             range_header = kwargs["headers"]["Range"]
             requested_ranges.append(range_header)
             start, end = (int(x) for x in range_header.removeprefix("bytes=").split("-"))
-            return _response(200, lambda block_size, s=start, e=end: iter([total_body[s : e + 1]]))
+            return _response(206, lambda block_size, s=start, e=end: iter([total_body[s : e + 1]]))
 
         with patch(
             "k2s_downloader.core.downloader.requests.head",
@@ -453,7 +453,7 @@ class TestFindResumeProgress:
         def get_side_effect(*args, **kwargs):
             range_header = kwargs["headers"]["Range"]
             if range_header == "bytes=0-4":
-                return _response(200, lambda block_size: iter([total_body[0:5]]))
+                return _response(206, lambda block_size: iter([total_body[0:5]]))
             return _response(403, lambda block_size: iter([]))
 
         with patch.object(downloader_module, "MAX_CHUNK_RETRIES", 1), patch(

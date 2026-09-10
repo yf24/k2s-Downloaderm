@@ -2,6 +2,27 @@
 
 > 最新進度快照，寫給接手的下一個 agent（人類也可讀）。**動態內容，很快會過期** — 若本檔與 `git log`／GitHub 上實際的 PR/Issue 狀態衝突，一律以 `git log`／GitHub 現況為準。
 
+## 現況（2026-09-10）
+
+- **第三輪（R3）立項：使用者實測回報兩個獨立問題（2026-09-10）**——(1) 下載下來的壓縮檔有機率解壓縮失敗；
+  (2) 下載過程一直斷掉，而原版程式即使慢到誇張也總能掛到跑完。分析後拆成 10 項（R3-1 ~ R3-10），
+  見 `docs/ai/todolist.md` 的「第三輪（R3）」段落。**兩組問題彼此獨立**：壞檔的核心漏洞（`abs_tol=1`）
+  原版就有；斷線則是本 fork 後來加上 `MAX_CHUNK_RETRIES` 才出現的（原版失敗是 50ms 後無限重試、沒有上限）。
+- **R3-1／R3-2／R3-3／R3-5（靜默壞檔）2026-09-10 完成**，分支 `fix/r3-1-silent-corruption-integrity`：
+  區段位元組數改為精確相等並同時檢查 part 檔實際落地大小（原本 `math.isclose(abs_tol=1)` 三處都容許 ±1 byte，
+  10.4GB 檔 = 500 段，任一段差 1 byte 就會讓其後所有位元組位移 → 影片仍可播、壓縮檔必壞）；
+  新增 `Content-Range` 驗證與「`200` 代表伺服器忽略 `Range`」的拒收（長度對但 offset 錯的回應原本無法區分）；
+  `_merge_parts` 前置 `_verify_parts()` 逐段驗證、合併後驗總長度，並新增 `DownloadIntegrityError`；
+  part 檔與 manifest 在 rename／replace 前加 `fsync`。測試 `tests/test_downloader_integrity.py`（14 項），
+  全套 169 項通過、`ruff check .` 乾淨。
+- **下一步（尚未動工）**：R3-4（與 K2S API `size` 對帳）收尾資料正確性；R3-6 ~ R3-10 處理斷線問題，
+  其中 **R3-6（壞掉的 URL slot 因為「掃描永遠從 index 0 開始」而被優先重複派工）嫌疑最大**。
+  動工前務必先讀 R2-16 的「給下一個 agent 的教訓」——不要用「重新解 captcha ＋重新產生 URL」當重試手段。
+- **本輪取得的實證（下一個 agent 可直接引用，省一次調查）**：使用者本機 `%APPDATA%/K2SDownloaderm/urls.json`
+  顯示 K2S 暫時 URL 帶 `ip_access_policy=first`、`concurrency=1`、`rate_limit=51200`（50KB/s）、
+  `size=10484711424`，且 20 支 URL 指向不同儲存節點；實打 `getFilesInfo` API 確認**有** `size`、
+  但該檔 `md5` 為 `None`（帶 `extended_info: true` 亦同），所以無法做 hash 級端到端驗證。
+
 ## 現況（2026-07-18）
 
 - **R2-17（下載開始前先預覽上次進度）2026-07-18 使用者提出並完成**：新增 `Downloader.find_resume_progress(tmp_dir, file_id)`（純本機掃描 `*.manifest.json`，不打網路），GUI 的 `url_edit` 在 `editingFinished` 時觸發查詢，若有相符的續傳 manifest 就顯示上次完成百分比／位元組數，找不到則隱藏。細節見 `docs/ai/todolist.md` R2-17 項。

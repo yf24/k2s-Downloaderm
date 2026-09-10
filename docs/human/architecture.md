@@ -98,6 +98,7 @@ CLI/GUI
 |---|---|---|
 | `DownloadCancelled` | `download()` 執行期間任何時候 `stop_event` 被設定（透過 `Downloader.cancel()`） | 「使用者／呼叫端自己停止的」，不算錯誤。 |
 | `ChunkDownloadFailed` | 單一 byte-range 區段耗盡 `MAX_CHUNK_RETRIES`（25）次嘗試 | 「我們放棄了」。與 `DownloadCancelled` 區分開，讓呼叫端可以針對「你自己停的」跟「跑不完」分別呈現不同的 UI／exit code。刻意**不**在整個下載層級自動重跑 —— 見 `todolist.md` 的 R2-16。 |
+| `DownloadIntegrityError` | 合併時發現某個 part 檔大小已不符合其區段，或合併後的檔案大小不等於所有區段總和 | 「磁碟上的位元組不是你要的那個檔案」。是 `RuntimeError` 的子類別，既有的「下載失敗」處理仍能捕捉；獨立成一類是為了讓呼叫端能分辨本機／資料完整性失敗與網路失敗。part 不符時**不動**任何 part 檔與 manifest（下次執行續傳只重抓那一段）；合併後大小不符則刪除不完整的輸出檔，而不是把它交還（R3-3）。 |
 | `K2SFileNotFound` | Keep2Share API 回報檔案不存在 | 可被捕捉、非致命 — 取代了舊版會從背景 thread 直接 `sys.exit()` 殺掉整個 process（含 GUI）的行為。 |
 | `OperationCancelled`（在 `k2s_client` 內） | 在 captcha／URL 產生階段（尚未開始任何區塊下載前）`stop_event` 被設定 | 會被 `Downloader.download()` 捕捉並重新丟成 `DownloadCancelled`，讓呼叫端無論在哪個階段被取消，都只需處理一種取消例外類型。 |
 | `RuntimeError`（各種訊息） | 查詢大小／檔名時網路不可達；captcha 答錯達 `MAX_CAPTCHA_ATTEMPTS` 次；所有 proxy 都試過仍拿不到任何可用 URL；大小無法判斷 | 每則訊息都會指出可能原因（IP 被封鎖、速率限制等），而不是直接丟出原始的 `requests` 例外。 |

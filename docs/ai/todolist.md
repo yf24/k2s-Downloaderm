@@ -180,6 +180,144 @@
   - 測試：`tests/test_downloader_resume_and_streaming.py::TestFindResumeProgress`（6 個：tmp_dir 不存在、無相符 manifest、正確計算百分比、忽略損毀 manifest、忽略缺欄位的 manifest、以及用真實下載跑出來的 manifest 驗證 schema 一致）。GUI 端手動用已裝 PySide6 的本機環境跑過（`MainWindow` 實例化、設定 URL、觸發 `editingFinished`、確認 label 正確顯示/隱藏），未寫自動化 GUI 測試（符合 AGENTS.md 既有慣例）。核心測試套件（155 項）全數通過，`ruff check .` 乾淨。
   - 文件：`docs/ai/requirements.md`／`docs/human/requirements.md` 新增 AC-10.7、AC-11.5；`docs/ai/architecture.md`／`docs/human/architecture.md` §2 控制流程段落後補充說明。
 
+# 第三輪（R3）— 2026-09-10 使用者實測回報後的 backlog
+
+> 背景：使用者用打包出的 exe 實際下載 K2S 上的 10.4GB 多卷 RAR（`....part05.rar`）時回報兩件事：
+> **(1) 下載下來的壓縮檔有機率解壓縮失敗；(2) 下載過程一直斷掉，而原版程式即使速度慢到誇張也總能掛到跑完**
+> （使用者補充：原版也會有機率下載到壞檔）。本輪的分析同時參考了三份實證，不只是靜態閱讀：
+>
+> - **使用者本機的 `urls.json`**（`%APPDATA%/K2SDownloaderm/`）：K2S 發的暫時下載 URL 帶有
+>   `ip_access_policy=first`、`concurrency=1`、`rate_limit=51200`（50KB/s）、`size=10484711424`，
+>   且 20 支 URL 指向不同儲存節點（`str-116` / `str-122` / `str-123`.filestore.app）。
+> - **實際打 K2S `getFilesInfo` API**：會回 `size`（權威值），但這個檔案的 `md5` 是 `None`
+>   （即使帶 `extended_info: true` 也一樣）—— 所以無法用 hash 做端到端驗證，`size` 是目前唯一可用的權威對帳值。
+> - **原版程式碼**（commit `7f4c27c` 的 `download_chunk`）：整段包在 `contextlib.suppress(Exception)` 裡，
+>   失敗只把 `inUse` 清掉就 return，排程迴圈下一個 tick（50ms）立刻重派 —— **沒有重試上限、沒有 backoff**。
+>   這正是「原版慢歸慢但掛著就會跑完」的原因，而斷線問題是本 fork 後來加上 `MAX_CHUNK_RETRIES` 才出現的。
+>
+> **兩組問題彼此獨立**：壞檔（R3-P0）的核心漏洞 `abs_tol=1` 原版就有（原版第 349 行一模一樣，對得上使用者說的
+> 「原版也會壞檔」）；斷線（R3-P1）則是本 fork 新加的重試上限造成，原版沒有這個行為。
+
+## R3-P0 — 資料正確性：靜默壞檔（下載完全不驗內容，只驗長度）
+
+> 共同背景：整條路徑上唯一的正確性證明就是「長度」，而且**非媒體檔連事後檢查都沒有**——
+> `should_check_media()` 只認 `MEDIA_EXTENSIONS`（mp4/mkv/...），媒體檔壞掉會被 ffmpeg 抓到並自動加大 split 重下一次
+> （REQ-8），`.rar`/`.zip`/`.7z` 則是直接交檔。所以壞檔機率對所有檔案可能是一樣的，只是**只有壓縮檔會浮出來**。
+> 本輪四項（R3-1/2/3/5）已於 2026-09-10 一併完成，分支 `fix/r3-1-silent-corruption-integrity`；
+> 測試：`tests/test_downloader_integrity.py`（14 項）。核心測試套件 169 項全過，`ruff check .` 乾淨。
+
+- [x] **R3-1 區段位元組數用 `math.isclose(..., abs_tol=1)` 模糊比對，且只信記憶體計數器**（2026-09-10 完成）
+  - 位置：`downloader.py` 三處 —— `_download_chunk` 的收尾檢查、`_run_scheduling_loop` 的 part 重用分支、`_prepare_resume`
+  - 問題：`abs_tol=1` 表示**少 1 byte 或多 1 byte 都算通過**。使用者那個 10.4GB 檔以 20MiB 切成 **500 段**，
+    任何一段少 1 byte，合併後其後所有位元組整體位移 —— 影片仍能播（所以 ffmpeg 檢查也未必抓得到），
+    但 RAR/ZIP 的 CRC 必定失敗。另外檢查的對象是自己累加的 `bytes_written`，只證明「交給 `write()` 多少」，
+    不證明「檔案裡實際有多少」。
+  - 做法：三處一律改成精確相等（`!=` / `==`）；`_download_chunk` 另外用 `os.fstat(part_file.fileno()).st_size`
+    取得實際落地大小，與計數器一起檢查，兩者都必須等於 `expected_bytes` 才 rename。
+  - 測試：`TestChunkByteCountMustMatchExactly`（少 1／多 1 byte 皆被拒、剛好相等才通過、
+    以及「計數器對但磁碟少 1 byte」也會被擋）、`TestResumeRequiresAnExactlySizedPart`。
+
+- [x] **R3-2 不驗證回應描述的 range，長度對但 offset 錯的回應無法區分**（2026-09-10 完成）
+  - 位置：`downloader.py` `_download_chunk`（原本只檢查 `status_code not in (200, 206)`）
+  - 問題：① `200` 代表伺服器**忽略了 `Range`**、正在從 offset 0 送整個檔案，卻被當成成功回應接受；
+    ② `206` 的 `Content-Range` 從未被檢查 —— 快取型 proxy 或儲存節點若回了另一個窗格（長度一樣、位元組不一樣），
+    在現行程式裡與成功**完全無法區分**，會把不屬於這裡的資料接到輸出檔中間。K2S 這批 URL 綁定
+    `ip_access_policy=first`＋`concurrency=1`，而 `_acquire_proxy_lock()` 是**每個 chunk 隨機換 proxy**，
+    等於不斷從不同 IP 打同一支綁定 IP 的 URL，本來就容易拿到非預期回應。
+  - 做法：新增 `_parse_content_range()`（模組級）與 `Downloader._check_served_range()`：206 的 `Content-Range`
+    必須恰好等於請求的起訖；`200` 在 `split_count > 1` 時直接判失敗（訊息明說「server ignored the Range request」，
+    不再被誤報成 size mismatch）；`206` 沒帶或無法解析 `Content-Range` 則維持只靠長度判定（不因讀不到的 header 殺掉區段）。
+  - 測試：`TestServedRangeMustMatchTheRequestedRange`（5 項）。附帶把
+    `tests/test_downloader_resume_and_streaming.py` 中多區段情境的 mock 從 200 改成 206（更貼近真實伺服器行為）。
+
+- [x] **R3-3 合併前後完全沒有驗證：`_merge_parts` 相信磁碟上任何找得到的 part 檔**（2026-09-10 完成）
+  - 位置：`downloader.py` `_merge_parts`
+  - 問題：part 檔落地時驗過一次，但那可能是**上一次執行**的事；之後發生的任何損壞（當機、寫入中斷、
+    續傳撿到殘留檔）在合併時無人再檢查，合併完也不驗最終檔案大小。對 `.rar` 這種沒有 ffmpeg 檢查的檔案，
+    整條路徑等於零驗證。
+  - 做法：拆出 `_verify_parts()`：**在寫出第一個位元組之前**逐一 stat 每個 part 檔比對其區段大小，不符就丟
+    `DownloadIntegrityError` 並**保留**所有 part 檔與 manifest（下次執行會續傳、只重抓損毀那段——
+    `_prepare_resume` 與排程重用分支本來就會拒收大小不符的 part 並重下）。合併後 `fsync` 輸出檔並驗證
+    最終大小等於所有區段總和，不符則刪掉不完整的輸出檔再丟 `DownloadIntegrityError`（這種情況 part 已被
+    邊合併邊刪除，沒得續傳，留著一個看起來正常的半成品最危險）。part 檔仍維持「邊合併邊刪」以免尖峰
+    磁碟用量變成兩倍檔案大小。
+  - 測試：`TestPartsAreVerifiedAroundTheMerge`（4 項：大小不符中止且保留續傳狀態、part 缺失中止、
+    正常合併並消耗 part、輸出短少時刪除輸出檔）。
+
+- [ ] **R3-4 不與 K2S API 的 `size` 對帳，HEAD 的 `Content-Length` 是唯一來源**
+  - 位置：`downloader.py` `_fetch_total_size` / `download()`；`k2s_client.get_name`
+  - 問題：整個 range 佈局都建立在 HEAD 的 `Content-Length` 上。`getFilesInfo` 已經會回權威的 `size`
+    （實測 `9ca49ba8208ef` → `10484711424`），而 `get_name()` 明明已經打了同一支 API 卻只取 `name` 就丟掉其餘欄位。
+    若 HEAD 因為任何原因回了不同的長度，現在沒有任何機制會發現。
+  - 建議做法：`k2s_client` 新增 `get_file_info(file_id) -> dict`（`get_name` 改為薄包裝維持相容），
+    `download()` 一次取回 name＋size，把 size 傳給 `_download_once` 與 HEAD 的 `Content-Length` 對帳，
+    不符則丟 `RuntimeError`（訊息指向「下載 URL 可能已過期／被導向錯誤內容」）。API 沒回 size（或回 0）時跳過檢查。
+  - 註記：`md5` 欄位實測為 `None`，所以**無法**做 hash 級端到端驗證；這也是為什麼長度鏈的每一環都要精確。
+  - 測試：mock `getFilesInfo` 回 size 與 HEAD 不符 → 立即失敗；size 缺席 → 照常下載。
+
+- [x] **R3-5 part／manifest 未 fsync → 斷電後「大小正確但內容為 0」仍被續傳採信**（2026-09-10 完成）
+  - 位置：`downloader.py` `_download_chunk` 的 `.tmp` 寫入、`_persist_manifest`
+  - 問題：串流寫入只有 `part_file.flush()`（把資料交給 OS），沒有 `fsync`。當機／斷電後 NTFS 很可能留下
+    **大小正確但內容未實際寫入（為 0）** 的 part 檔；續傳只能依大小判斷，會直接採信 → 靜默壞檔。
+    manifest 同理：半寫入的 manifest 在下次執行會被 `_load_manifest` 判為毀損 → `_prepare_resume` 視為
+    「沒有先前進度」→ **清掉該檔名下所有 part 檔**（對 10GB 檔就是幾小時的進度全沒了）。
+  - 做法：`.tmp` 在 rename 成 `.partNN` 之前先 `flush()` + `os.fsync()`；manifest 在 `replace()` 之前一樣。
+    兩者都是每段／每次完成各一次小成本操作。
+  - 測試：無法在單元測試裡真的斷電；以既有的串流／manifest 測試確保行為未回歸（`os.fsync` 對正常路徑無副作用）。
+
+## R3-P1 — 可靠性：下載一直中途斷掉（本 fork 新加的行為，原版沒有）
+
+> 共同背景：原版對任何失敗都是 50ms 後無限重試；本 fork 加了 `MAX_CHUNK_RETRIES`(25)＋exponential backoff
+> ＋status code 檢查後，**單一區段耗盡預算就會中止整個下載**。在 `rate_limit=51200`（一段 20MiB 要跑約 7 分鐘）
+> 的免費節點上，失敗是常態而非例外，於是「掛著就會跑完」變成「常常跑到一半整包中止」。
+> 以下五項尚未動工，建議照 R3-6 → R3-7 → R3-8 → R3-9 → R3-10 的順序做（前三項改動小、風險低）。
+
+- [ ] **R3-6 壞掉的 URL slot 會被優先重複派工（放大器，嫌疑最大）**
+  - 位置：`downloader.py` `_run_scheduling_loop` 的 `for thread_index in range(ctx.threads)`
+  - 問題：這個掃描**永遠從 index 0 開始**。健康的 slot 因為正在跑一段 20MiB（約 7 分鐘）而鎖著；
+    一支已經壞掉的 URL 則是 1 秒內失敗、鎖立刻放開 —— 結果幾乎每一次重試都被塞給同一支壞 URL。
+    程式對 proxy 有失敗計數與降級（`_note_proxy_failure`／`PROXY_FAILURE_EVICTION_THRESHOLD`），
+    **對 URL slot 卻完全沒有對應機制**，也沒有冷卻。500 個區段輪流去撞同一支壞 URL，等於集體累積失敗次數。
+  - 建議做法：比照 proxy 加上 per-URL-slot 連續失敗計數與冷卻（冷卻中的 slot 不派工）；
+    slot 掃描改成從隨機／輪替起點開始，避免「最快失敗的 slot 最常被選中」。
+  - 測試：mock 一支永遠 403 的 URL slot，驗證它會被冷卻、且其他區段不會被它把重試預算燒光。
+
+- [ ] **R3-7 單一區段耗盡預算就中止整包下載，且 `attempts` 全程累計不重置**
+  - 位置：`downloader.py` `MAX_CHUNK_RETRIES`、`_mark_chunk_failed`、`_run_scheduling_loop` 的 `failed_chunk` 分支
+  - 問題：`range_meta["attempts"]` 從頭累加到尾，永遠不會因為「其他區段有進度」而重置；
+    25 次配上 backoff 大約 10 分鐘就能燒完 —— 一支壞 URL 持續壞 10 分鐘，就足以讓跑了 3 小時的下載整包中止。
+    而且判斷單位是「單一區段」，499 段都正常也照樣中止。
+  - 建議做法：把「放棄」的判準從 per-chunk 次數改成**全域無進度看門狗**（例如：連續 N 分鐘內沒有任何區段完成
+    才視為真的卡死），這才是「IP／proxy pool 全被封鎖」的正確訊號；per-chunk 次數改為只用來換 proxy／換 slot，
+    或在任何區段完成時重置（衰減）。注意 R2-16 的教訓：**不要**用「重新解 captcha ＋重新產生 URL」當重試手段。
+  - 測試：一支區段連續失敗但其他區段持續完成時，下載不得中止；全部區段都沒有進度超過門檻時才丟 `ChunkDownloadFailed`。
+
+- [ ] **R3-8 backoff 上限 30s／stall timeout 20s 對 50KB/s 的免費節點太兇**
+  - 位置：`downloader.py` `CHUNK_RETRY_BACKOFF_CAP`（30s）、`CHUNK_STALL_TIMEOUT`（20s）、`CHUNK_REQUEST_TIMEOUT`（20s）
+  - 問題：原版重試間隔是 0.05s，本 fork 是最高 30s；在尾端只剩少數區段時，等待成本直接反映成「卡住不動」。
+    另外 `rate_limit=51200` 的節點一段要跑 7 分鐘，20 秒沒有新位元組就放棄整段（且丟掉已下載的部分）過於敏感。
+  - 建議做法：backoff cap 降到 3~5s（或改成綁在 slot／proxy 上而非綁在區段上）；`CHUNK_STALL_TIMEOUT` 提高到 60~120s。
+    兩者都只是常數調整，但**必須連同 R3-10 一起看**：stall 放寬的前提是斷掉時不要丟掉已下載的部分。
+  - 測試：既有 timeout 測試沿用；補一項驗證 backoff 上限值的回歸測試。
+
+- [ ] **R3-9 url slot 與 proxy 未綁定，牴觸 K2S URL 的 `ip_access_policy=first`**
+  - 位置：`downloader.py` `_acquire_proxy_lock()`（每個 chunk 隨機挑 proxy）
+  - 問題：從 `urls.json` 實證，每支下載 URL 帶 `ip_access_policy=first`（綁定第一個存取它的 IP）與 `concurrency=1`。
+    現在每個 chunk 隨機換 proxy，同一支 URL 前後會從不同 IP 打過去 —— host 端有充分理由拒絕。
+    原版也這樣做，只是它把回應吞掉並無限重試，所以看不出來。
+  - 建議做法：url slot ↔ proxy 全程一對一綁定（該 slot 的所有區段固定走同一個出口 IP）；
+    某個 proxy 死掉時，讓該 slot 連同 URL 一起退場（或重新取得一支 URL），而不是換 IP 繼續打舊 URL。
+  - 測試：驗證同一 `thread_index` 的連續請求使用同一個 proxy index；proxy 被降級時該 slot 的行為。
+
+- [ ] **R3-10 區段斷線不續傳：`.tmp` 直接丟棄，50KB/s 下每次最多丟掉 7 分鐘傳輸量**
+  - 位置：`downloader.py` `_download_chunk` 的失敗路徑（`tmp_write_path.unlink(missing_ok=True)`）
+  - 問題：R2-7 之後資料已經是邊收邊寫進 `.partNN.tmp`，但只要失敗就整份刪除重來。在 50KB/s 的節點上，
+    一段 20MiB 失敗一次就等於丟掉最多 7 分鐘 —— 這也是「進度看起來一直倒退」的來源之一。
+  - 建議做法：失敗時保留 `.tmp`，重試時以 `Range: bytes=(start + 已寫入)-end` 續抓並以 `ab` 開啟續寫；
+    需搭配 R3-2 的 `Content-Range` 驗證（續抓的起點必須正好等於已寫入的位置，否則視為失敗並清掉重來）。
+    這是本輪對「慢速線路實際體感」改善最大的一項，但改動也最大，建議最後做。
+  - 測試：模擬第一次只收到一半就斷線，驗證重試時的 `Range` 起點正確、最終 part 檔位元組與完整下載一致。
+
 ---
 
 ## 建議處理順序
@@ -191,6 +329,13 @@
 採用）；R2-11 部分完成（telemetry 與零成本提示已做，「依數據調整預設」需要真實使用數據才能決定，留待
 之後）（見各項狀態與 PR 連結）。R2-12 仍未認領，建議等 R2-11 的 telemetry 累積到真實使用數據後再決定
 要採用哪個尾端對策；其對策 4（縮小尾端 split）零架構改動可先行，不需要等數據。
+
+第三輪（R3-1 ~ R3-10）：**R3-P0 的 R3-1、R3-2、R3-3、R3-5 已於 2026-09-10 完成**（分支
+`fix/r3-1-silent-corruption-integrity`，測試 `tests/test_downloader_integrity.py`）——使用者指定「先修風險比較高的」，
+而靜默壞檔是唯一會**無聲交出壞資料**的一類，優先於會明顯報錯的斷線問題。剩下的建議順序：
+R3-4（API `size` 對帳，收尾資料正確性）→ R3-6 → R3-7 → R3-8（三項合起來才是「斷線」的完整解，
+其中 R3-6 是嫌疑最大的放大器）→ R3-9 → R3-10（改動最大，但對慢速線路的體感改善也最大）。
+R3-8 的 stall timeout 放寬**必須**等 R3-10 做完才安全（否則放寬只是讓每次丟掉的傳輸量更多）。
 
 **R2-P6（R2-14、R2-15）** 是 2026-07-17 使用者直接提出的兩項流程／文件維護改善（review 留言截斷問題、
 todolist 歸檔機制），與上述 R2-1~R2-13 的程式碼修正屬不同性質；兩項皆已完成（見各項狀態）。本檔（含
