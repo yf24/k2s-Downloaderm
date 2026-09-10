@@ -108,11 +108,12 @@ Retry/backoff parameters (module-level constants in `downloader.py` / `k2s_clien
 
 | Constant | Value | Governs |
 |---|---|---|
-| `MAX_CHUNK_RETRIES` | 25 | Attempts per byte-range chunk before `ChunkDownloadFailed` (raised 8 -> 25 in R2-16's revert -- see `todolist.md`) |
+| `MAX_CHUNK_RETRIES` | 25 | **Consecutive** failures of one byte-range chunk *while the download as a whole makes no progress* before `ChunkDownloadFailed` (raised 8 -> 25 in R2-16's revert; changed from a lifetime counter to a progress-relative one in R3-7 -- see `todolist.md`) |
 | `CHUNK_RETRY_BACKOFF_BASE` / `_CAP` | 1.0s / 30.0s | Exponential backoff between chunk retry attempts |
 | `MAX_CAPTCHA_ATTEMPTS` | 3 | Rejected captcha answers before giving up |
 | `MAX_URL_BATCH_ROUNDS` | 3 | Consecutive zero-progress rounds fetching download URLs from one proxy before trying the next |
 | `PROXY_FAILURE_EVICTION_THRESHOLD` | 3 | Consecutive chunk failures via one proxy before it's evicted from `working_proxy_indexes` (R2-10) |
+| `URL_SLOT_FAILURE_THRESHOLD` / `URL_SLOT_COOLDOWN_SECONDS` | 3 / 60s | Consecutive chunk failures via one download-URL slot before that slot is benched, and for how long (R3-6). Each Keep2Share URL is bound to the first IP that uses it, so slots fail independently of proxies |
 | `PROXY_CACHE_TTL_SECONDS` | 12h | Age at which a cached proxy list is treated as stale and revalidated instead of returned as-is (R2-10, `proxy.py`) |
 
 ### Timeout inventory
@@ -122,8 +123,8 @@ Every outbound HTTP call in this project carries an explicit timeout (NFR-1); no
 | Constant | Module | Value | Purpose |
 |---|---|---|---|
 | `HEAD_REQUEST_TIMEOUT` | `downloader.py` | 15s | Discovering total file size |
-| `CHUNK_REQUEST_TIMEOUT` | `downloader.py` | 20s | Connect/read timeout for each chunk's `GET` |
-| `CHUNK_STALL_TIMEOUT` | `downloader.py` | 20s | Separate stall watchdog: abandon a chunk attempt if no new bytes arrive within this window, even though the socket itself hasn't timed out |
+| `CHUNK_CONNECT_TIMEOUT` / `CHUNK_READ_TIMEOUT` | `downloader.py` | 20s / 45s | Connect and read timeouts for each chunk's `GET`, passed together as `CHUNK_REQUEST_TIMEOUT` (requests' `(connect, read)` pair). Read is the generous one (R3-8): a free download URL is rate-limited to ~50KB/s, so a segment takes minutes and a host going quiet for half a minute is normal |
+| `CHUNK_STALL_TIMEOUT` | `downloader.py` | 60s | Separate stall watchdog: abandon a chunk attempt if no new bytes arrive within this window. Deliberately above `CHUNK_READ_TIMEOUT` — the socket layer should be what normally notices a dead transfer; this only catches one the socket still considers alive |
 | `DEFAULT_TIMEOUT` | `k2s_client.py` | 15s | General Keep2Share API calls (captcha fetch, filename lookup, URL batch generation) |
 | `CAPTCHA_SOLVE_TIMEOUT` | `k2s_client.py` | 5s | The per-proxy captcha-solve probe specifically — deliberately shorter so one dead proxy doesn't stall the whole captcha loop |
 | `HTTPS_TIMEOUT` | `proxy.py` | 5s | Per-candidate reachability probe during proxy validation |
