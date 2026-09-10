@@ -119,22 +119,30 @@ def _parse_content_range(raw: object) -> Optional[tuple[int, int]]:
 # Previously unset, so a blocked/unresponsive IP would hang here forever.
 HEAD_REQUEST_TIMEOUT = 15
 
-# Connect/read timeout (seconds) passed to `requests.get` for each chunk
-# download. Previously a magic number inlined at the call site.
-CHUNK_REQUEST_TIMEOUT = 20
-# Separate from CHUNK_REQUEST_TIMEOUT: a stall watchdog checked between
-# `iter_content` reads. If no new data arrives within this many seconds the
-# attempt is abandoned (the size-mismatch/retry path below picks it up),
-# even though the underlying socket hasn't timed out yet. Coincidentally the
-# same value as CHUNK_REQUEST_TIMEOUT today, but they control different
-# things and are kept as separate constants.
-CHUNK_STALL_TIMEOUT = 20
+# Connect/read timeouts (seconds) passed to `requests.get` for each chunk
+# download, as requests' `(connect, read)` pair. Read is far more generous
+# than connect (R3-8): Keep2Share's free download URLs are rate-limited to
+# ~50KB/s (`rate_limit=51200` in the issued URL), so one 20MiB segment takes
+# around seven minutes, and a host that goes quiet for half a minute mid-
+# segment is normal rather than dead. The old flat 20s killed such a segment
+# and -- until a stalled attempt can resume from its `.tmp` (R3-10) -- threw
+# away every byte it had already downloaded.
+CHUNK_CONNECT_TIMEOUT = 20
+CHUNK_READ_TIMEOUT = 45
+CHUNK_REQUEST_TIMEOUT = (CHUNK_CONNECT_TIMEOUT, CHUNK_READ_TIMEOUT)
+# Backstop for the same stall, checked between `iter_content` reads. Set
+# above CHUNK_READ_TIMEOUT deliberately: the socket layer is what should
+# normally notice a dead transfer, and this only catches a transfer the
+# socket considers alive (a trickle of empty/keep-alive reads).
+CHUNK_STALL_TIMEOUT = 60
 # Overall deadline (seconds) for joining in-flight chunk threads when the
-# scheduling loop exits. Slightly above CHUNK_REQUEST_TIMEOUT because a
-# thread blocked inside `requests.get` only notices `stop_event` once the
-# socket-level connect/read timeout fires; threads in the streaming loop or
-# in `_acquire_proxy_lock` exit within a block read / 0.02s.
-CHUNK_THREADS_JOIN_TIMEOUT = 30.0
+# scheduling loop exits. Kept above CHUNK_READ_TIMEOUT because a thread
+# blocked inside `requests.get` only notices `stop_event` once the
+# socket-level read timeout fires; threads in the streaming loop or in
+# `_acquire_proxy_lock` exit within a block read / 0.02s. This is also the
+# worst case for how long a cancel or an abort takes to settle, which is why
+# it tracks the read timeout rather than being raised independently.
+CHUNK_THREADS_JOIN_TIMEOUT = 50.0
 # R2-11: minimum real-time gap (seconds) between throughput telemetry status
 # messages during a download. Checked every scheduling-loop poll tick (every
 # ~0.05s) but only actually emits a message once this many seconds have
@@ -243,6 +251,17 @@ CHUNK_RETRY_BACKOFF_CAP = 30.0
 # removed, so one that degraded mid-download (or was flaky from the start)
 # kept being preferentially reselected for the rest of the run.
 PROXY_FAILURE_EVICTION_THRESHOLD = 3
+# R3-6: consecutive chunk failures through one download-URL slot before that
+# slot is benched for `URL_SLOT_COOLDOWN_SECONDS`. Keep2Share issues one URL
+# per slot, each bound to the first IP that uses it (`ip_access_policy=first`
+# in the issued URL) -- so a slot can die on its own while every other slot
+# keeps working. Until this existed only proxies were tracked, and a dead
+# slot was actively *preferred*: the scheduler scanned slots from index 0 and
+# a slot that fails in a second is free again long before a healthy slot that
+# is seven minutes into a segment, so nearly every retry landed on the broken
+# one and burned the whole download's retry budget there.
+URL_SLOT_FAILURE_THRESHOLD = 3
+URL_SLOT_COOLDOWN_SECONDS = 60.0
 
 
 def _emit_status(callback: StatusCallback, message: str) -> None:
@@ -337,6 +356,11 @@ class Downloader:
         self._working_proxy_lock = threading.Lock()
         self._manifest_lock = threading.Lock()
         self._bytes_downloaded = 0
+        # R3-7: bumped under _progress_lock whenever the download as a whole
+        # moves forward (any byte received, any range credited). A range's
+        # retry budget is measured against this rather than against the run
+        # as a whole -- see _mark_chunk_failed.
+        self._progress_token = 0
         self._total_bytes = 0
         self._ranges_total = 0
         self._done_count = 0
@@ -357,6 +381,14 @@ class Downloader:
         self.proxy_locks: List[threading.Lock] = []
         self.working_proxy_indexes: List[int] = []
         self.url_locks: List[threading.Lock] = []
+        # R3-6 per-download-URL-slot health, guarded by _url_slot_lock:
+        # consecutive failures, the time each benched slot becomes eligible
+        # again, and a rotating scan cursor so slot 0 isn't perpetually the
+        # first candidate.
+        self._url_slot_lock = threading.Lock()
+        self._url_slot_failures: Dict[int, int] = {}
+        self._url_slot_cooldown_until: Dict[int, float] = {}
+        self._url_slot_cursor = 0
         self._active_proxy_indexes: set[int] = set()
         # R2-10: consecutive-failure count per proxy index, guarded by
         # _working_proxy_lock alongside working_proxy_indexes (the two are
@@ -643,7 +675,12 @@ class Downloader:
         return removed
 
     def _mark_chunk_failed(
-        self, range_meta: Dict[str, object], reason: str, *, proxy_idx: Optional[int] = None
+        self,
+        range_meta: Dict[str, object],
+        reason: str,
+        *,
+        proxy_idx: Optional[int] = None,
+        url_slot: Optional[int] = None,
     ) -> None:
         """Record a failed chunk attempt with a bounded retry budget.
 
@@ -651,12 +688,30 @@ class Downloader:
         with exponential backoff. Once ``MAX_CHUNK_RETRIES`` is exceeded,
         marks the range as permanently ``failed`` so the scheduling loop in
         ``_download_once`` can stop and raise ``ChunkDownloadFailed`` instead
-        of retrying forever. ``proxy_idx``, when given, also feeds R2-10's
-        per-proxy failure tracking (see ``_note_proxy_failure``).
+        of retrying forever. ``proxy_idx``/``url_slot``, when given, also feed
+        the per-proxy (R2-10) and per-URL-slot (R3-6) failure tracking.
+
+        R3-7: that budget counts *consecutive failures during which the
+        download as a whole made no progress*, not failures over the run's
+        lifetime. The counter used to only ever go up, so a multi-hour
+        download accumulated a death sentence out of ordinary bad luck --
+        25 unlucky moments spread across three hours aborted a download whose
+        other 499 segments were finishing normally. Measured against
+        ``_progress_token`` instead, the budget still stops a genuinely stuck
+        download (nothing anywhere is moving, so nothing resets) within the
+        same ~10 minutes as before, while a download that is visibly getting
+        somewhere is never killed by one unlucky range.
         """
         reason = _truncate_error_message(reason)
         if proxy_idx is not None:
             self._note_proxy_failure(proxy_idx)
+        if url_slot is not None:
+            self._note_url_slot_failure(url_slot)
+        with self._progress_lock:
+            progress_token = self._progress_token
+        if range_meta.get("progress_token") != progress_token:
+            range_meta["attempts"] = 0
+            range_meta["progress_token"] = progress_token
         attempts = int(range_meta.get("attempts", 0)) + 1
         range_meta["attempts"] = attempts
         range_meta["last_error"] = reason
@@ -705,6 +760,63 @@ class Downloader:
                 f"Proxy {self.proxies[proxy_idx]} failed {count} times in a row; "
                 "deprioritizing it."
             )
+
+    def _note_url_slot_failure(self, thread_index: int) -> None:
+        """Bench a download-URL slot that keeps failing (R3-6).
+
+        Cooldown rather than eviction: a Keep2Share URL can recover (the
+        block is usually per-IP or per-rate-limit-window, not permanent), and
+        with only ``threads`` URLs in hand there is nothing to replace a
+        retired one with. Benching it is enough -- the point is to stop a
+        one-second failure loop from monopolising the retries that healthy,
+        seven-minutes-per-segment slots cannot compete for.
+        """
+        benched_until = None
+        with self._url_slot_lock:
+            count = self._url_slot_failures.get(thread_index, 0) + 1
+            self._url_slot_failures[thread_index] = count
+            if count >= URL_SLOT_FAILURE_THRESHOLD:
+                benched_until = time.time() + URL_SLOT_COOLDOWN_SECONDS
+                self._url_slot_cooldown_until[thread_index] = benched_until
+                self._url_slot_failures[thread_index] = 0
+        if benched_until is not None:
+            self.log(
+                f"Download URL #{thread_index} failed {URL_SLOT_FAILURE_THRESHOLD} times in a row; "
+                f"resting it for {URL_SLOT_COOLDOWN_SECONDS:.0f}s and using the others meanwhile."
+            )
+
+    def _note_url_slot_success(self, thread_index: int) -> None:
+        """Clear a slot's failure streak so a recovered URL isn't left one
+        step away from being benched again."""
+        with self._url_slot_lock:
+            self._url_slot_failures.pop(thread_index, None)
+            self._url_slot_cooldown_until.pop(thread_index, None)
+
+    def _acquire_url_slot(self) -> Optional[int]:
+        """Claim a download-URL slot's lock, or ``None`` if none is available.
+
+        Scanning starts from a rotating cursor instead of always from 0, so
+        the slot that frees up first is not automatically the slot that gets
+        used next; combined with the cooldown above, that is what stops a
+        fast-failing URL from soaking up every dispatch (R3-6).
+        """
+        total = len(self.url_locks)
+        if not total:
+            return None
+        now = time.time()
+        with self._url_slot_lock:
+            start = self._url_slot_cursor % total
+            cooling = dict(self._url_slot_cooldown_until)
+        for offset in range(total):
+            thread_index = (start + offset) % total
+            if cooling.get(thread_index, 0.0) > now:
+                continue
+            if not self.url_locks[thread_index].acquire(blocking=False):
+                continue
+            with self._url_slot_lock:
+                self._url_slot_cursor = thread_index + 1
+            return thread_index
+        return None
 
     def _acquire_proxy_lock(self) -> Optional[int]:
         """Pick a proxy and atomically acquire its lock.
@@ -910,6 +1022,8 @@ class Downloader:
             return
         with self._progress_lock:
             self._bytes_downloaded += delta
+            if delta > 0:
+                self._progress_token += 1
             downloaded = self._bytes_downloaded
             done = self._done_count
             # is_direct is None for bytes credited without a live connection
@@ -1087,6 +1201,7 @@ class Downloader:
                         range_meta,
                         f"HTTP {response.status_code} via proxy {proxy_value or 'LOCAL'}",
                         proxy_idx=proxy_idx,
+                        url_slot=thread_index,
                     )
                     return
 
@@ -1102,6 +1217,7 @@ class Downloader:
                         range_meta,
                         f"{range_error} via proxy {proxy_value or 'LOCAL'}",
                         proxy_idx=proxy_idx,
+                        url_slot=thread_index,
                     )
                     return
 
@@ -1143,6 +1259,7 @@ class Downloader:
                     range_meta,
                     f"request error via proxy {proxy_value or 'LOCAL'}: {exc}",
                     proxy_idx=proxy_idx,
+                    url_slot=thread_index,
                 )
                 return
 
@@ -1160,6 +1277,7 @@ class Downloader:
                     f"size mismatch: got {bytes_written} ({bytes_on_disk} on disk) "
                     f"expected {expected_bytes}",
                     proxy_idx=proxy_idx,
+                    url_slot=thread_index,
                 )
                 # Do NOT release url_locks[thread_index] here: the ``finally``
                 # below is the single release point. Releasing early meant the
@@ -1171,6 +1289,7 @@ class Downloader:
 
             range_meta.pop("last_error", None)
             tmp_write_path.replace(tmp_filename)
+            self._note_url_slot_success(thread_index)
             with self._working_proxy_lock:
                 is_newly_known = proxy_idx not in self.working_proxy_indexes
                 if is_newly_known:
@@ -1205,6 +1324,11 @@ class Downloader:
             # disk write failure) is recorded the same way a network
             # failure is, instead of the old blanket suppress-and-ignore.
             tmp_write_path.unlink(missing_ok=True)
+            # No `url_slot=` here, unlike the network/response failures above:
+            # an unclassified error at this point is as likely to be local
+            # (a failing disk, an antivirus lock) as it is to be the URL's
+            # fault, and benching every slot in turn over a local problem
+            # would only stall the download further.
             self._mark_chunk_failed(
                 range_meta,
                 f"unexpected error via proxy {proxy_value or 'LOCAL'}: {exc}",
@@ -1300,19 +1424,20 @@ class Downloader:
                         else:
                             part_path.unlink()
 
-                    for thread_index in range(ctx.threads):
-                        if self.url_locks[thread_index].locked():
-                            continue
-                        self.url_locks[thread_index].acquire()
-                        meta["inUse"] = True
-                        chunk_thread = threading.Thread(
-                            target=self._download_chunk,
-                            args=(idx, meta, thread_index, ctx),
-                            daemon=True,
-                        )
-                        chunk_threads.append(chunk_thread)
-                        chunk_thread.start()
-                        break
+                    thread_index = self._acquire_url_slot()
+                    if thread_index is None:
+                        # Every download URL is either busy or resting
+                        # (R3-6); this range keeps its turn and is picked up
+                        # on a later pass.
+                        continue
+                    meta["inUse"] = True
+                    chunk_thread = threading.Thread(
+                        target=self._download_chunk,
+                        args=(idx, meta, thread_index, ctx),
+                        daemon=True,
+                    )
+                    chunk_threads.append(chunk_thread)
+                    chunk_thread.start()
                 self._maybe_report_throughput()
                 time.sleep(0.05)
         except KeyboardInterrupt:
@@ -1464,6 +1589,13 @@ class Downloader:
         ranges = self._build_ranges(total_size, split_count)
         self._ranges_total = len(ranges)
         self.url_locks = [threading.Lock() for _ in range(threads)]
+        with self._url_slot_lock:
+            # Slot health is indexed into this run's URL list; carrying it
+            # over would bench a slot for a URL that no longer exists.
+            self._url_slot_failures = {}
+            self._url_slot_cooldown_until = {}
+            self._url_slot_cursor = 0
+        self._progress_token = 0
 
         # Must run before dispatching any chunk: it decides, per range,
         # whether an on-disk part file from a previous attempt is safe to
@@ -1504,10 +1636,12 @@ class Downloader:
 
         if failed_chunk is not None:
             raise ChunkDownloadFailed(
-                f"Chunk {failed_chunk.chunk_idx} failed after {failed_chunk.attempt_count} attempts "
-                f"(last error: {failed_chunk.last_error}). The source IP and/or every proxy tried may "
-                "be blocked or rate-limited. If you're on a dynamic IP, restarting your router/modem "
-                "to get a new one may help."
+                f"Chunk {failed_chunk.chunk_idx} failed {failed_chunk.attempt_count} times in a row "
+                f"without the download making any progress elsewhere (last error: "
+                f"{failed_chunk.last_error}). The source IP and/or every proxy tried may be blocked "
+                "or rate-limited. If you're on a dynamic IP, restarting your router/modem to get a "
+                "new one may help. Completed segments are kept -- starting the download again "
+                "resumes from where this one stopped."
             )
 
         if self.stop_event.is_set():

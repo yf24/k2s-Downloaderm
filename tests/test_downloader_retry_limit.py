@@ -51,8 +51,11 @@ class TestMarkChunkFailedBookkeeping:
         downloader = self._downloader()
         # 5 prior failures -> this call becomes attempt #6. With base=1.0 the
         # uncapped exponential backoff would be 2**5 == 32s; it must be
-        # clamped to CHUNK_RETRY_BACKOFF_CAP (30s) instead.
-        meta: dict = {"attempts": 5}
+        # clamped to CHUNK_RETRY_BACKOFF_CAP (30s) instead. The range carries
+        # the downloader's current progress token, i.e. those 5 failures
+        # happened without the download progressing in between -- otherwise
+        # R3-7 would (correctly) restart the budget here.
+        meta: dict = {"attempts": 5, "progress_token": 0}
 
         with patch.object(downloader_module.time, "time", return_value=1000.0):
             downloader._mark_chunk_failed(meta, "still failing")

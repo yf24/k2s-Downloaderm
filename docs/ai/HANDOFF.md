@@ -15,8 +15,15 @@
   `_merge_parts` 前置 `_verify_parts()` 逐段驗證、合併後驗總長度，並新增 `DownloadIntegrityError`；
   part 檔與 manifest 在 rename／replace 前加 `fsync`。測試 `tests/test_downloader_integrity.py`（14 項），
   全套 169 項通過、`ruff check .` 乾淨。
-- **下一步（尚未動工）**：R3-4（與 K2S API `size` 對帳）收尾資料正確性；R3-6 ~ R3-10 處理斷線問題，
-  其中 **R3-6（壞掉的 URL slot 因為「掃描永遠從 index 0 開始」而被優先重複派工）嫌疑最大**。
+- **R3-6／R3-7／R3-8（下載一直中途斷掉）2026-09-10 完成**，分支 `fix/r3-6-r3-8-stop-aborting-on-transient-failures`：
+  URL slot 加上連續失敗計數與 60 秒冷卻、slot 掃描改成輪替游標（原本永遠從 index 0 開始掃，導致「一秒就失敗的壞
+  slot」永遠比「跑了七分鐘的健康 slot」先被選中，吸走所有重試）；重試預算改成相對於 `_progress_token`——
+  只要下載整體有進度就重置，`MAX_CHUNK_RETRIES` 的語意自動變成「毫無進度期間的連續失敗次數」，
+  因此不需要另外做全域看門狗；chunk 逾時拆成 `(connect=20, read=45)`、stall 看門狗 60s、join 50s。
+  **backoff 上限刻意維持 30s**（R3-7 之後它只在整體卡住時才會碰到，那時慢慢退避才是對的）。
+  測試 `tests/test_downloader_url_slot_health.py`（10 項，已驗證會 fail 在修正前的行為），全套 179 項通過。
+- **下一步（尚未動工）**：R3-4（與 K2S API `size` 對帳，資料正確性收尾，改動小）；R3-9（url slot ↔ proxy 全程綁定，
+  對應 `ip_access_policy=first`）與 R3-10（區段斷線從 `.tmp` 續傳，改動最大但對慢速線路體感改善最大）。
   動工前務必先讀 R2-16 的「給下一個 agent 的教訓」——不要用「重新解 captcha ＋重新產生 URL」當重試手段。
 - **本輪取得的實證（下一個 agent 可直接引用，省一次調查）**：使用者本機 `%APPDATA%/K2SDownloaderm/urls.json`
   顯示 K2S 暫時 URL 帶 `ip_access_policy=first`、`concurrency=1`、`rate_limit=51200`（50KB/s）、

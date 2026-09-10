@@ -270,9 +270,15 @@
 > 共同背景：原版對任何失敗都是 50ms 後無限重試；本 fork 加了 `MAX_CHUNK_RETRIES`(25)＋exponential backoff
 > ＋status code 檢查後，**單一區段耗盡預算就會中止整個下載**。在 `rate_limit=51200`（一段 20MiB 要跑約 7 分鐘）
 > 的免費節點上，失敗是常態而非例外，於是「掛著就會跑完」變成「常常跑到一半整包中止」。
-> 以下五項尚未動工，建議照 R3-6 → R3-7 → R3-8 → R3-9 → R3-10 的順序做（前三項改動小、風險低）。
+> R3-6／R3-7／R3-8 已於 2026-09-10 一併完成（分支 `fix/r3-6-r3-8-stop-aborting-on-transient-failures`，
+> 測試 `tests/test_downloader_url_slot_health.py` 共 10 項；全套 179 項通過、`ruff check .` 乾淨）。
+> 三項的核心是同一件事：**失敗在這個環境是常態，不該讓常態殺掉整個下載**——壞掉的 URL 不再吸走所有重試（R3-6）、
+> 重試預算改成相對於「整體有沒有進度」（R3-7）、逾時參數改成符合 50KB/s 節點的現實（R3-8）。
+> 剩下 R3-9、R3-10 尚未動工。
 
-- [ ] **R3-6 壞掉的 URL slot 會被優先重複派工（放大器，嫌疑最大）**
+- [x] **R3-6 壞掉的 URL slot 會被優先重複派工（放大器，嫌疑最大）**（2026-09-10 完成，分支 `fix/r3-6-r3-8-stop-aborting-on-transient-failures`；測試：`tests/test_downloader_url_slot_health.py::TestSlotCooldown`、`TestBrokenSlotDoesNotSoakUpTheDownload`）
+  - 實作：新增 `URL_SLOT_FAILURE_THRESHOLD`(3)／`URL_SLOT_COOLDOWN_SECONDS`(60) 與 `_note_url_slot_failure()`／`_note_url_slot_success()`／`_acquire_url_slot()`（狀態由專屬 `_url_slot_lock` 保護，每次 `_download_once` 重建 `url_locks` 時一併清空——舊計數指向的是上一批 URL）。排程迴圈原本的「`for thread_index in range(ctx.threads)` 掃到第一個沒鎖的就用」整段換成 `_acquire_url_slot()`：從輪替游標開始掃、跳過冷卻中的 slot。`_mark_chunk_failed` 新增 `url_slot=` 參數，`_download_chunk` 的四個**網路／回應層**失敗點都會回報（HTTP 狀態、range 不符、request 例外、size mismatch）；最外層 `except Exception` 的「未分類錯誤」刻意**不**回報——那類錯誤同樣可能是本機磁碟／防毒造成的，為此把每個 slot 輪流冷卻只會讓下載更卡。成功路徑呼叫 `_note_url_slot_success()` 清除連續失敗數。
+  - 選擇冷卻而非淘汰（對照 proxy 的 `_note_proxy_failure`）：K2S 的封鎖通常是 per-IP／per-rate-limit-window 而非永久，而且手上總共只有 `threads` 支 URL，淘汰了也沒有替補。
   - 位置：`downloader.py` `_run_scheduling_loop` 的 `for thread_index in range(ctx.threads)`
   - 問題：這個掃描**永遠從 index 0 開始**。健康的 slot 因為正在跑一段 20MiB（約 7 分鐘）而鎖著；
     一支已經壞掉的 URL 則是 1 秒內失敗、鎖立刻放開 —— 結果幾乎每一次重試都被塞給同一支壞 URL。
@@ -282,7 +288,11 @@
     slot 掃描改成從隨機／輪替起點開始，避免「最快失敗的 slot 最常被選中」。
   - 測試：mock 一支永遠 403 的 URL slot，驗證它會被冷卻、且其他區段不會被它把重試預算燒光。
 
-- [ ] **R3-7 單一區段耗盡預算就中止整包下載，且 `attempts` 全程累計不重置**
+- [x] **R3-7 單一區段耗盡預算就中止整包下載，且 `attempts` 全程累計不重置**（2026-09-10 完成，同分支；測試：`tests/test_downloader_url_slot_health.py::TestRetryBudgetRestartsOnProgress`）
+  - **最後採用的做法比原本設想的更小**：沒有新增「全域無進度看門狗」，而是新增 `self._progress_token`（在 `_report_progress` 的 `_progress_lock` 內、delta > 0 時遞增，涵蓋「收到任何位元組」與「重用分支記入任何區段」兩種進度）。`_mark_chunk_failed` 比對 `range_meta["progress_token"]` 與當下的 token，不同就把 `attempts` 歸零重算。
+  - **為什麼不需要看門狗**：改成這樣之後，`MAX_CHUNK_RETRIES` 的語意自動變成「整個下載毫無進度期間的連續失敗次數」——所有區段都被封鎖時沒有任何進度、也就沒有任何重置，某個區段照樣會在約 10 分鐘（backoff 上限 30s × 25 次）內耗盡預算並丟出 `ChunkDownloadFailed`，跟原本的「IP 被封鎖」偵測時間一樣；反過來說，只要下載看得出有進展，就不會再被單一倒楣區段殺掉。等於用一個計數器同時得到兩種行為，不必再多一套逾時機制。
+  - 已知取捨：若某個 range 是**真的**永遠抓不到（例如伺服器對那個 offset 一律拒絕），現在要等其他 499 段都跑完、進度停止後才會判定失敗——使用者會多等，但 part 檔都還在，重跑續傳只會重抓那一段。相較之下舊行為是「第 1 小時就整包中止」，這個取捨是划算的。
+  - `ChunkDownloadFailed` 的訊息已改寫，明說是「連續失敗且期間整個下載毫無進度」，並補上「已完成的區段會保留，重新開始會續傳」。
   - 位置：`downloader.py` `MAX_CHUNK_RETRIES`、`_mark_chunk_failed`、`_run_scheduling_loop` 的 `failed_chunk` 分支
   - 問題：`range_meta["attempts"]` 從頭累加到尾，永遠不會因為「其他區段有進度」而重置；
     25 次配上 backoff 大約 10 分鐘就能燒完 —— 一支壞 URL 持續壞 10 分鐘，就足以讓跑了 3 小時的下載整包中止。
@@ -292,7 +302,11 @@
     或在任何區段完成時重置（衰減）。注意 R2-16 的教訓：**不要**用「重新解 captcha ＋重新產生 URL」當重試手段。
   - 測試：一支區段連續失敗但其他區段持續完成時，下載不得中止；全部區段都沒有進度超過門檻時才丟 `ChunkDownloadFailed`。
 
-- [ ] **R3-8 backoff 上限 30s／stall timeout 20s 對 50KB/s 的免費節點太兇**
+- [x] **R3-8 backoff 上限 30s／stall timeout 20s 對 50KB/s 的免費節點太兇**（2026-09-10 完成，同分支；只做了逾時的部分，backoff 上限**刻意維持 30s**，理由見下）
+  - **backoff 上限維持 30s（推翻本項原本的建議）**：R3-7 之後，backoff 的長短是 `attempts` 的函數，而 `attempts` 會在有進度時歸零 —— 也就是說 30s 這個上限**只有在整個下載完全卡住時才會碰到**，而那正是應該慢慢重試的情境；下載順利時一次失敗只會退避 1 秒。降低上限反而會讓「真的被封鎖」的偵測從 10 分鐘縮短到約 2 分鐘，對慢速線路太急躁。
+  - **逾時實際改動**：原本 `timeout=CHUNK_REQUEST_TIMEOUT`（純量 20，等於 connect 與 read 都是 20s），所以 `CHUNK_STALL_TIMEOUT`(20) 幾乎沒有機會先觸發——socket 的 read timeout 一定先到。現在拆成 `CHUNK_CONNECT_TIMEOUT`(20) / `CHUNK_READ_TIMEOUT`(45)，`CHUNK_REQUEST_TIMEOUT` 變成 `(connect, read)` 的 tuple；`CHUNK_STALL_TIMEOUT` 提高到 60，並在註解裡寫明它現在的角色是「socket 仍認為連線活著時的最後防線」，而不是主要偵測手段。
+  - **連帶調整**：`CHUNK_THREADS_JOIN_TIMEOUT` 30 → 50（原註解就說它要略高於 request timeout，因為卡在 `requests.get` 裡的 thread 要等 socket 逾時才會看到 `stop_event`）。副作用：取消／中止最久要 50 秒才收斂完成（GUI 關窗只等 1 秒後就讓 process 結束，不受影響）。
+  - **尚未放寬到 60~120s**：如 todolist 原本註記的，stall 放寬的前提是斷掉時不要丟掉已下載的部分（R3-10）。45s 是在「不要因為節點喘一口氣就砍掉七分鐘的傳輸」與「別讓取消變得太遲鈍」之間的折衷；R3-10 完成後可以再往上調。
   - 位置：`downloader.py` `CHUNK_RETRY_BACKOFF_CAP`（30s）、`CHUNK_STALL_TIMEOUT`（20s）、`CHUNK_REQUEST_TIMEOUT`（20s）
   - 問題：原版重試間隔是 0.05s，本 fork 是最高 30s；在尾端只剩少數區段時，等待成本直接反映成「卡住不動」。
     另外 `rate_limit=51200` 的節點一段要跑 7 分鐘，20 秒沒有新位元組就放棄整段（且丟掉已下載的部分）過於敏感。
@@ -335,7 +349,11 @@
 而靜默壞檔是唯一會**無聲交出壞資料**的一類，優先於會明顯報錯的斷線問題。剩下的建議順序：
 R3-4（API `size` 對帳，收尾資料正確性）→ R3-6 → R3-7 → R3-8（三項合起來才是「斷線」的完整解，
 其中 R3-6 是嫌疑最大的放大器）→ R3-9 → R3-10（改動最大，但對慢速線路的體感改善也最大）。
-R3-8 的 stall timeout 放寬**必須**等 R3-10 做完才安全（否則放寬只是讓每次丟掉的傳輸量更多）。
+
+**進度**：R3-6／R3-7／R3-8 已於 2026-09-10 完成（分支 `fix/r3-6-r3-8-stop-aborting-on-transient-failures`）。
+剩下 **R3-4**（資料正確性收尾，改動小）與 **R3-9／R3-10**（斷線問題的後半，改動較大）。
+R3-8 的 stall timeout 只放寬到 45s／60s，要再往上調**必須**等 R3-10 做完（否則放寬只是讓每次丟掉的傳輸量更多）。
+R3-9（url slot ↔ proxy 綁定）與 R3-6 是互補的：R3-6 讓壞掉的 slot 退場，R3-9 則從源頭減少 slot 被打壞的機會。
 
 **R2-P6（R2-14、R2-15）** 是 2026-07-17 使用者直接提出的兩項流程／文件維護改善（review 留言截斷問題、
 todolist 歸檔機制），與上述 R2-1~R2-13 的程式碼修正屬不同性質；兩項皆已完成（見各項狀態）。本檔（含

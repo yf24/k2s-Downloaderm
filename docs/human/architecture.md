@@ -108,11 +108,12 @@ CLI/GUI
 
 | 常數 | 值 | 控制對象 |
 |---|---|---|
-| `MAX_CHUNK_RETRIES` | 25 | 單一 byte-range 區段在丟出 `ChunkDownloadFailed` 前的嘗試次數（R2-16 revert 時從 8 調高 —— 見 `todolist.md`） |
+| `MAX_CHUNK_RETRIES` | 25 | 單一 byte-range 區段在**整個下載毫無進度期間**的**連續**失敗次數上限，超過才丟出 `ChunkDownloadFailed`（R2-16 revert 時從 8 調高；R3-7 把它從「整趟累計」改為「相對於進度」——見 `todolist.md`） |
 | `CHUNK_RETRY_BACKOFF_BASE` / `_CAP` | 1.0 秒 / 30.0 秒 | 區段重試之間的指數 backoff |
 | `MAX_CAPTCHA_ATTEMPTS` | 3 | 放棄前允許 captcha 答錯的次數 |
 | `MAX_URL_BATCH_ROUNDS` | 3 | 同一個 proxy 連續幾輪拿不到任何新 URL 就換下一個 |
 | `PROXY_FAILURE_EVICTION_THRESHOLD` | 3 | 同一個 proxy 連續失敗幾次後從 `working_proxy_indexes` 移除（R2-10） |
+| `URL_SLOT_FAILURE_THRESHOLD` / `URL_SLOT_COOLDOWN_SECONDS` | 3 / 60s | 單一下載 URL slot 連續失敗幾次會被冷卻、以及冷卻多久（R3-6）。每支 K2S URL 綁定第一個使用它的 IP，所以 slot 的好壞與 proxy 是各自獨立的 |
 | `PROXY_CACHE_TTL_SECONDS` | 12 小時 | 快取的 proxy 清單超過多久視為過期並重新驗證（R2-10，`proxy.py`） |
 
 ### Timeout 一覽
@@ -122,8 +123,8 @@ CLI/GUI
 | 常數 | 模組 | 值 | 用途 |
 |---|---|---|---|
 | `HEAD_REQUEST_TIMEOUT` | `downloader.py` | 15 秒 | 查詢檔案總大小 |
-| `CHUNK_REQUEST_TIMEOUT` | `downloader.py` | 20 秒 | 每個區段 `GET` 的 connect/read timeout |
-| `CHUNK_STALL_TIMEOUT` | `downloader.py` | 20 秒 | 獨立的停滯監控：即使 socket 本身沒 timeout，只要這段時間內沒有新資料進來就放棄這次嘗試 |
+| `CHUNK_CONNECT_TIMEOUT` / `CHUNK_READ_TIMEOUT` | `downloader.py` | 20s / 45s | 每個區段 `GET` 的連線／讀取逾時，合併成 `CHUNK_REQUEST_TIMEOUT` 這個 `(connect, read)` pair 傳給 requests。讀取端刻意放寬（R3-8）：免費下載 URL 被限速在約 50KB/s，一段本來就要跑好幾分鐘，中途安靜半分鐘是常態而非死掉 |
+| `CHUNK_STALL_TIMEOUT` | `downloader.py` | 60s | 獨立的 stall 看門狗：這段時間內沒有新位元組就放棄該次嘗試。刻意設得比 `CHUNK_READ_TIMEOUT` 高——正常情況下應該由 socket 層先發現連線已死，這裡只負責接住 socket 仍認為活著的那種情況 |
 | `DEFAULT_TIMEOUT` | `k2s_client.py` | 15 秒 | Keep2Share API 一般呼叫（取得 captcha、查詢檔名、批次產生 URL） |
 | `CAPTCHA_SOLVE_TIMEOUT` | `k2s_client.py` | 5 秒 | 專門給每個 proxy 的 captcha 解答探測 — 刻意設短，避免單一失效 proxy 卡住整個 captcha 迴圈 |
 | `HTTPS_TIMEOUT` | `proxy.py` | 5 秒 | Proxy 驗證階段對每個候選的可達性測試 |
